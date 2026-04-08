@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 69220,
+  "artifact_model_bytes_int8_zlib": 2751520,
+  "artifact_total_bytes_int8_zlib": 2820740,
+  "proxy_only": true,
+  "proxy_val_loss": 0.252146493066938,
+  "run_id": "smoke_ctxonly_rawpred_dim128_l2_seq128_mse_vicreg_lmres2_5min_g1",
+  "subset_val_bpb": 3.423739492615274,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 80474,
+  "artifact_model_bytes_int8_zlib": 2813322,
+  "artifact_total_bytes_int8_zlib": 2893796,
+  "proxy_only": true,
+  "proxy_val_loss": 0.603690254439875,
+  "run_id": "smoke_ctxdelta_t4_fsinfo4_dim192_l2_seq128_cos_vicreg_lmmlp256_w005_5min_g1",
+  "subset_val_bpb": 3.2764853479083356,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

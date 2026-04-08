@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 101999,
+  "artifact_model_bytes_int8_zlib": 2796267,
+  "artifact_total_bytes_int8_zlib": 2898266,
+  "proxy_only": true,
+  "proxy_val_loss": 0.387663292705682,
+  "run_id": "smoke_ctxdelta_dirlog_scaledprobe_5min_g0",
+  "subset_val_bpb": 2.5651821722096386,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

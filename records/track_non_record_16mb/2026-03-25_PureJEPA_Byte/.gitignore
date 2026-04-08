@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+runs/.DS_Store
+runs/*/final_model.pt
+runs/*/final_model.int8.ptz

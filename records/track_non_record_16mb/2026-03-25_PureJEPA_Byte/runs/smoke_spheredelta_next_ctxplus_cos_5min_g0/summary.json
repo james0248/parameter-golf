@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 87376,
+  "artifact_model_bytes_int8_zlib": 2581218,
+  "artifact_total_bytes_int8_zlib": 2668594,
+  "proxy_only": true,
+  "proxy_val_loss": 1.0721989825835136,
+  "run_id": "smoke_spheredelta_next_ctxplus_cos_5min_g0",
+  "subset_val_bpb": 4.848182952922143,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

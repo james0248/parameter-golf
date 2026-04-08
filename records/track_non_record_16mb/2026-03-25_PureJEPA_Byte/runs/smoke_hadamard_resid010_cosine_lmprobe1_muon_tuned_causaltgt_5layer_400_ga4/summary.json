@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 64682,
+  "artifact_model_bytes_int8_zlib": 6357150,
+  "artifact_total_bytes_int8_zlib": 6421832,
+  "proxy_only": true,
+  "proxy_val_loss": 0.7559834392556106,
+  "run_id": "smoke_hadamard_resid010_cosine_lmprobe1_muon_tuned_causaltgt_5layer_400_ga4",
+  "subset_val_bpb": 2.417570657839914,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130112
+}

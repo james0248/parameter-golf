@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 121926,
+  "artifact_model_bytes_int8_zlib": 5444541,
+  "artifact_total_bytes_int8_zlib": 5566467,
+  "proxy_only": true,
+  "proxy_val_loss": 0.05925606689453125,
+  "run_id": "tmp_ctxdelta_l4_unetskip05_bs90112_probe",
+  "subset_val_bpb": 7.94202059401758,
+  "val_bpb": null,
+  "validation_bytes": 1048576,
+  "validation_full_bytes": 151130624
+}

@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 90791,
+  "artifact_model_bytes_int8_zlib": 2458372,
+  "artifact_total_bytes_int8_zlib": 2549163,
+  "proxy_only": true,
+  "proxy_val_loss": 0.18749431715745193,
+  "run_id": "smoke_additivedelta_runtime",
+  "subset_val_bpb": 8.044786648904191,
+  "val_bpb": null,
+  "validation_bytes": 1048576,
+  "validation_full_bytes": 151130624
+}

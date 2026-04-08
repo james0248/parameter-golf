@@ -1,0 +1,2590 @@
+"""
+Byte-level pure-JEPA training scaffold for the Parameter Golf non-record track.
+
+This file intentionally copies the useful generic infrastructure from the root
+`train_gpt.py` baseline:
+- env-driven hyperparameters
+- FineWeb shard loading
+- distributed setup
+- wallclock-aware training loop
+- validation aggregation
+- log preservation
+- artifact-size accounting with int8 + zlib roundtrip export
+
+Model iteration should normally happen in `model.py`, not in this file.
+"""
+
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import json
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.distributed as dist
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from baseline_gpt import compile_muon_backend
+from model import PureByteJEPA, configure_optimizers
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[2]
+REPO_DATASET_PATH = REPO_ROOT / "data" / "datasets" / "fineweb10B_byte260"
+REPO_TOKENIZER_PATH = REPO_ROOT / "data" / "tokenizers" / "fineweb_pure_byte_260.json"
+
+
+class Hyperparameters:
+    data_path = os.environ.get("DATA_PATH", str(REPO_DATASET_PATH))
+    train_files = os.path.join(data_path, "fineweb_train_*.bin")
+    val_files = os.path.join(data_path, "fineweb_val_*.bin")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", str(REPO_TOKENIZER_PATH))
+    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    seed = int(os.environ.get("SEED", 1337))
+
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_bytes = int(os.environ.get("VAL_MAX_BYTES", 0))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+
+    iterations = int(os.environ.get("ITERATIONS", 20_000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 0))
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 1))
+    train_batch_bytes = int(os.environ.get("TRAIN_BATCH_BYTES", 524_288))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    enable_torch_compile = bool(int(os.environ.get("ENABLE_TORCH_COMPILE", "0")))
+
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
+    byte_offset = int(os.environ.get("BYTE_OFFSET", 4))
+    byte_count = int(os.environ.get("BYTE_COUNT", 256))
+    allow_nonstandard_byte_data = bool(int(os.environ.get("ALLOW_NONSTANDARD_BYTE_DATA", "0")))
+
+    model_dim = int(os.environ.get("MODEL_DIM", 256))
+    num_layers = int(os.environ.get("NUM_LAYERS", 4))
+    num_heads = int(os.environ.get("NUM_HEADS", 4))
+    mlp_hidden_dim = int(os.environ.get("MLP_HIDDEN_DIM", 1024))
+    predictor_hidden_dim = int(os.environ.get("PREDICTOR_HIDDEN_DIM", 512))
+    predictor_num_layers = int(os.environ.get("PREDICTOR_NUM_LAYERS", 0))
+    predictor_num_heads = int(os.environ.get("PREDICTOR_NUM_HEADS", os.environ.get("NUM_HEADS", "4")))
+    predictor_input = os.environ.get("PREDICTOR_INPUT", "context_latent")
+    predictor_style = os.environ.get("PREDICTOR_STYLE", "direct")
+    action_dim = int(os.environ.get("ACTION_DIM", 64))
+    transition_hidden_dim = int(os.environ.get("TRANSITION_HIDDEN_DIM", os.environ.get("PREDICTOR_HIDDEN_DIM", "512")))
+    predictor_model_layers = int(os.environ.get("PREDICTOR_MODEL_LAYERS", os.environ.get("NUM_LAYERS", "4")))
+    predictor_model_heads = int(os.environ.get("PREDICTOR_MODEL_HEADS", os.environ.get("NUM_HEADS", "4")))
+    predictor_model_mlp_hidden_dim = int(
+        os.environ.get("PREDICTOR_MODEL_MLP_HIDDEN_DIM", os.environ.get("MLP_HIDDEN_DIM", "1024"))
+    )
+    dropout = float(os.environ.get("DROPOUT", 0.0))
+    target_ema_decay = float(os.environ.get("TARGET_EMA_DECAY", 0.99))
+    eval_logit_scale = float(os.environ.get("EVAL_LOGIT_SCALE", 1.0))
+    jepa_loss = os.environ.get("JEPA_LOSS", "cosine")
+    eval_bridge = os.environ.get("EVAL_BRIDGE", "cosine")
+    target_codebook = os.environ.get("TARGET_CODEBOOK", "ema")
+    num_target_codebooks = int(os.environ.get("NUM_TARGET_CODEBOOKS", 1))
+    contextual_target = bool(int(os.environ.get("CONTEXTUAL_TARGET", "0")))
+    target_source = os.environ.get("TARGET_SOURCE", "codebook")
+    target_encoder_causal = bool(int(os.environ.get("TARGET_ENCODER_CAUSAL", "0")))
+    target_encoder_mode = os.environ.get("TARGET_ENCODER_MODE", "ema")
+    target_stop_grad = bool(int(os.environ.get("TARGET_STOP_GRAD", "1")))
+    target_anchor_weight = float(os.environ.get("TARGET_ANCHOR_WEIGHT", 0.5))
+    prototype_ema_decay = float(os.environ.get("PROTOTYPE_EMA_DECAY", 0.99))
+    contextual_residual_scale = float(os.environ.get("CONTEXTUAL_RESIDUAL_SCALE", 0.0))
+    contextual_aux_weight = float(os.environ.get("CONTEXTUAL_AUX_WEIGHT", 0.0))
+    lm_probe_weight = float(os.environ.get("LM_PROBE_WEIGHT", 0.0))
+    lm_probe_input = os.environ.get("LM_PROBE_INPUT", "pred_target")
+    lm_probe_hidden_dim = int(os.environ.get("LM_PROBE_HIDDEN_DIM", 0))
+    encoder_unet_skip = bool(int(os.environ.get("ENCODER_UNET_SKIP", "0")))
+    encoder_unet_skip_init = float(os.environ.get("ENCODER_UNET_SKIP_INIT", "1.0"))
+    target_future_steps = int(os.environ.get("TARGET_FUTURE_STEPS", 1))
+    aux_target_future_steps = os.environ.get("AUX_TARGET_FUTURE_STEPS", "")
+    aux_target_weight = float(os.environ.get("AUX_TARGET_WEIGHT", 0.0))
+    contextual_delta_normalization = os.environ.get("CONTEXTUAL_DELTA_NORMALIZATION", "normalized")
+    contextual_delta_reference = os.environ.get("CONTEXTUAL_DELTA_REFERENCE", "anchor")
+    contextual_delta_whitening = os.environ.get("CONTEXTUAL_DELTA_WHITENING", "none")
+    contextual_delta_whiten_eps = float(os.environ.get("CONTEXTUAL_DELTA_WHITEN_EPS", 1e-4))
+    contextual_delta_span = int(os.environ.get("CONTEXTUAL_DELTA_SPAN", 1))
+    contextual_delta_remove_topk = int(os.environ.get("CONTEXTUAL_DELTA_REMOVE_TOPK", 0))
+    contextual_delta_l1_weight = float(os.environ.get("CONTEXTUAL_DELTA_L1_WEIGHT", 0.0))
+    contextual_state_projector = os.environ.get("CONTEXTUAL_STATE_PROJECTOR", "none")
+    contextual_delta_parallel_weight = float(os.environ.get("CONTEXTUAL_DELTA_PARALLEL_WEIGHT", 0.0))
+    contextual_delta_magnitude_weight = float(os.environ.get("CONTEXTUAL_DELTA_MAGNITUDE_WEIGHT", 0.0))
+    contextual_delta_teacher_orth_weight = float(os.environ.get("CONTEXTUAL_DELTA_TEACHER_ORTH_WEIGHT", 0.0))
+    contextual_delta_contrastive_teacher_anchor = bool(
+        int(os.environ.get("CONTEXTUAL_DELTA_CONTRASTIVE_TEACHER_ANCHOR", "0"))
+    )
+    rotation_delta_loss_target = os.environ.get("ROTATION_DELTA_LOSS_TARGET", "diff")
+    additive_delta_normalization = os.environ.get("ADDITIVE_DELTA_NORMALIZATION", "none")
+    contrastive_weight = float(os.environ.get("CONTRASTIVE_WEIGHT", 0.0))
+    contrastive_temperature = float(os.environ.get("CONTRASTIVE_TEMPERATURE", 0.1))
+    contrastive_samples = int(os.environ.get("CONTRASTIVE_SAMPLES", 4096))
+    contrastive_future_steps = int(os.environ.get("CONTRASTIVE_FUTURE_STEPS", 1))
+    contrastive_mode = os.environ.get("CONTRASTIVE_MODE", "delta")
+    split_lm_probe_optimizer = bool(int(os.environ.get("SPLIT_LM_PROBE_OPTIMIZER", "0")))
+    lm_probe_lr = float(os.environ.get("LM_PROBE_LR", os.environ.get("LR", "3e-4")))
+    optimizer = os.environ.get("OPTIMIZER", "adamw")
+    embed_lr = float(os.environ.get("EMBED_LR", os.environ.get("LR", "3e-4")))
+    matrix_lr = float(os.environ.get("MATRIX_LR", os.environ.get("LR", "3e-4")))
+    scalar_lr = float(os.environ.get("SCALAR_LR", os.environ.get("LR", "3e-4")))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    var_reg_weight = float(os.environ.get("VAR_REG_WEIGHT", 0.0))
+    cov_reg_weight = float(os.environ.get("COV_REG_WEIGHT", 0.0))
+    target_var_reg_weight = float(os.environ.get("TARGET_VAR_REG_WEIGHT", 0.0))
+    target_cov_reg_weight = float(os.environ.get("TARGET_COV_REG_WEIGHT", 0.0))
+
+    lr = float(os.environ.get("LR", 3e-4))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.01))
+    beta1 = float(os.environ.get("BETA1", 0.9))
+    beta2 = float(os.environ.get("BETA2", 0.95))
+    adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
+
+
+@dataclass(frozen=True)
+class PureByteTokenizerConfig:
+    pad_id: int = 0
+    bos_id: int = 1
+    eos_id: int = 2
+    unk_id: int = 3
+    byte_offset: int = 4
+    byte_count: int = 256
+
+    @property
+    def vocab_size(self) -> int:
+        return self.byte_offset + self.byte_count
+
+
+def hyperparameters_dict(args: Hyperparameters) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, value in vars(args.__class__).items():
+        if name.startswith("_") or callable(value):
+            continue
+        out[name] = getattr(args, name)
+    return out
+
+
+def metric_tensor(value: Tensor | float | int, device: torch.device, dtype: torch.dtype = torch.float64) -> Tensor:
+    if isinstance(value, Tensor):
+        return value.to(device=device, dtype=dtype)
+    return torch.tensor(float(value), device=device, dtype=dtype)
+
+
+def load_byte_tokenizer_config(path: str) -> PureByteTokenizerConfig:
+    tokenizer_path = Path(path)
+    if not tokenizer_path.is_file():
+        return PureByteTokenizerConfig()
+    payload = json.loads(tokenizer_path.read_text(encoding="utf-8"))
+    if payload.get("tokenizer_type") != "pure_byte":
+        raise ValueError(f"Expected a pure_byte tokenizer JSON, got {payload.get('tokenizer_type')!r}")
+    config = payload.get("config", {})
+    tokenizer = PureByteTokenizerConfig(
+        pad_id=int(config.get("pad_id", 0)),
+        bos_id=int(config.get("bos_id", 1)),
+        eos_id=int(config.get("eos_id", 2)),
+        unk_id=int(config.get("unk_id", 3)),
+        byte_offset=int(config.get("byte_offset", 4)),
+        byte_count=int(config.get("byte_count", 256)),
+    )
+    vocab_size = int(payload.get("vocab_size", tokenizer.vocab_size))
+    if vocab_size != tokenizer.vocab_size:
+        raise ValueError(f"Tokenizer vocab_size mismatch: json={vocab_size} config={tokenizer.vocab_size}")
+    return tokenizer
+
+
+def validate_byte_tensor(values: Tensor, *, args: Hyperparameters, source: str) -> None:
+    if values.numel() == 0:
+        raise ValueError(f"{source} is empty")
+    check_values = values if values.dtype != torch.uint16 else values.to(dtype=torch.int32)
+    min_id = int(check_values.min().item())
+    max_id = int(check_values.max().item())
+    if min_id < 0 or max_id >= args.vocab_size:
+        raise ValueError(
+            f"{source} contains ids outside the byte260 tokenizer range "
+            f"[0, {args.vocab_size - 1}]: min={min_id} max={max_id}"
+        )
+
+
+def load_data_shard(file: Path, *, args: Hyperparameters) -> Tensor:
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    token_bytes = np.dtype("<u2").itemsize
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    num_tokens = int(header[2])
+    expected_size = header_bytes + num_tokens * token_bytes
+    if file.stat().st_size != expected_size:
+        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
+    values_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
+    if values_np.size != num_tokens:
+        raise ValueError(f"Short read for {file}")
+    values = torch.from_numpy(values_np.astype(np.uint16, copy=False))
+    validate_byte_tensor(values, args=args, source=str(file))
+    return values
+
+
+class ByteStream:
+    def __init__(self, pattern: str, *, args: Hyperparameters):
+        self.args = args
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.file_idx = 0
+        self.values = load_data_shard(self.files[0], args=args)
+        self.pos = 0
+
+    def _advance_file(self) -> None:
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.values = load_data_shard(self.files[self.file_idx], args=self.args)
+        self.pos = 0
+
+    def take(self, n: int) -> Tensor:
+        chunks: list[Tensor] = []
+        remaining = n
+        while remaining > 0:
+            available = self.values.numel() - self.pos
+            if available <= 0:
+                self._advance_file()
+                continue
+            k = min(remaining, available)
+            chunks.append(self.values[self.pos : self.pos + k])
+            self.pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedByteLoader:
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, *, args: Hyperparameters):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.args = args
+        self.stream = ByteStream(pattern, args=args)
+
+    def next_batch(self, global_bytes: int, seq_len: int, grad_accum_steps: int) -> Tensor:
+        denom = self.world_size * grad_accum_steps
+        if global_bytes % denom != 0:
+            raise ValueError(f"TRAIN_BATCH_BYTES={global_bytes} must be divisible by WORLD_SIZE*GRAD_ACCUM_STEPS={denom}")
+        local_bytes = global_bytes // denom
+        if local_bytes % seq_len != 0:
+            raise ValueError(f"Per-rank microbatch bytes={local_bytes} must be divisible by TRAIN_SEQ_LEN={seq_len}")
+        chunk = self.stream.take(local_bytes * self.world_size)
+        start = self.rank * local_bytes
+        local = chunk[start : start + local_bytes].to(dtype=torch.int64)
+        return local.reshape(-1, seq_len).to(self.device, non_blocking=True)
+
+
+def load_validation_bytes(pattern: str, seq_len: int, *, args: Hyperparameters) -> Tensor:
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    values = torch.cat([load_data_shard(file, args=args) for file in files]).contiguous()
+    usable = (values.numel() // seq_len) * seq_len
+    if usable <= 0:
+        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+    return values[:usable]
+
+
+CONTROL_TENSOR_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "CONTROL_TENSOR_NAME_PATTERNS",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+    ).split(",")
+    if pattern
+)
+INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_FP32_NAME_PATTERNS", ",".join(CONTROL_TENSOR_NAME_PATTERNS)).split(",")
+    if pattern
+)
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+
+
+def tensor_nbytes(t: Tensor) -> int:
+    return int(t.numel()) * int(t.element_size())
+
+
+def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+        return t.float().contiguous()
+    if t.dtype in {torch.float32, torch.bfloat16}:
+        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+    return t
+
+
+def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim == 2:
+        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    return q, scale
+
+
+def quantize_state_dict_int8(state_dict: dict[str, Tensor]) -> tuple[dict[str, object], dict[str, int]]:
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        q, s = quantize_float_tensor(t)
+        if s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "int8_clean_per_row_v1",
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if qmeta:
+        obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    qmeta = obj.get("qmeta", {})
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name]
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            s = s.to(dtype=torch.float32)
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+        else:
+            scale = float(s.item())
+            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+
+def eval_validation(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_bytes: Tensor,
+    *,
+    full_validation: bool,
+) -> dict[str, float | None]:
+    if args.val_batch_size % world_size != 0:
+        raise ValueError(f"VAL_BATCH_SIZE={args.val_batch_size} must be divisible by WORLD_SIZE={world_size}")
+    local_batch_bytes = args.val_batch_size // world_size
+    if local_batch_bytes < args.train_seq_len:
+        raise ValueError(
+            f"VAL_BATCH_SIZE must provide at least one sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    if local_batch_bytes % args.train_seq_len != 0:
+        raise ValueError(f"Per-rank validation bytes={local_batch_bytes} must be divisible by TRAIN_SEQ_LEN={args.train_seq_len}")
+
+    local_batch_seqs = local_batch_bytes // args.train_seq_len
+    total_seqs = val_bytes.numel() // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    nll_sum = torch.zeros((), device=device, dtype=torch.float64)
+    batch_count = torch.zeros((), device=device, dtype=torch.int64)
+    nll_batch_count = torch.zeros((), device=device, dtype=torch.int64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * args.train_seq_len
+            raw_end = batch_seq_end * args.train_seq_len
+            batch = val_bytes[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True).reshape(-1, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_metrics = model(batch, return_validation=True)
+            loss_sum += metric_tensor(batch_metrics["loss_sum"], device)
+            byte_count += metric_tensor(batch_metrics["num_bytes"], device)
+            batch_count += 1
+            if "nll_sum_nat" in batch_metrics:
+                nll_sum += metric_tensor(batch_metrics["nll_sum_nat"], device)
+                nll_batch_count += 1
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(nll_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(batch_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(nll_batch_count, op=dist.ReduceOp.SUM)
+
+    if byte_count.item() <= 0:
+        raise ValueError("Validation byte count must be positive")
+
+    proxy_loss = float((loss_sum / byte_count).item())
+    has_exact_nll = int(batch_count.item()) > 0 and int(nll_batch_count.item()) == int(batch_count.item())
+    subset_val_bpb = float((nll_sum / (math.log(2.0) * byte_count)).item()) if has_exact_nll else None
+    val_bpb = subset_val_bpb if full_validation else None
+    model.train()
+    return {
+        "proxy_loss": proxy_loss,
+        "subset_val_bpb": subset_val_bpb,
+        "val_bpb": val_bpb,
+    }
+
+
+def main() -> None:
+    code = Path(__file__).read_text(encoding="utf-8")
+    model_code = (SCRIPT_DIR / "model.py").read_text(encoding="utf-8")
+    args = Hyperparameters()
+    compile_muon_backend(enabled=args.enable_torch_compile and args.optimizer.lower() == "muon")
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if args.grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {args.grad_accum_steps}")
+    grad_scale = 1.0 / args.grad_accum_steps
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this training scaffold")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    master_process = rank == 0
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    run_dir = SCRIPT_DIR / "runs" / args.run_id
+    logfile = run_dir / "train.log"
+    if master_process:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(logfile)
+
+    def log0(msg: str, console: bool = True) -> None:
+        if not master_process:
+            return
+        if console:
+            print(msg)
+        with logfile.open("a", encoding="utf-8") as f:
+            print(msg, file=f)
+
+    if master_process:
+        (run_dir / "config.json").write_text(json.dumps(hyperparameters_dict(args), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (run_dir / "train_jepa_snapshot.py").write_text(code, encoding="utf-8")
+        (run_dir / "model_snapshot.py").write_text(model_code, encoding="utf-8")
+
+    log0(code, console=False)
+    log0("=" * 100, console=False)
+    log0(model_code, console=False)
+    log0("=" * 100, console=False)
+    log0(f"Running Python {sys.version}", console=False)
+    log0(f"Running PyTorch {torch.__version__}", console=False)
+    log0(
+        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+        console=False,
+    )
+    log0("=" * 100, console=False)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    tokenizer = load_byte_tokenizer_config(args.tokenizer_path)
+    dataset_dir = Path(args.data_path).resolve()
+    if not args.allow_nonstandard_byte_data and "byte260" not in dataset_dir.name:
+        raise ValueError(
+            f"Expected a byte260 dataset directory by default, got {dataset_dir.name!r}. "
+            "Set ALLOW_NONSTANDARD_BYTE_DATA=1 only if you are intentionally using a compatible custom export."
+        )
+    if tokenizer.vocab_size != args.vocab_size:
+        raise ValueError(f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={tokenizer.vocab_size}")
+    if tokenizer.byte_offset != args.byte_offset or tokenizer.byte_count != args.byte_count:
+        raise ValueError(
+            f"Byte tokenizer config mismatch: offset/count={tokenizer.byte_offset}/{tokenizer.byte_count}, "
+            f"expected {args.byte_offset}/{args.byte_count}"
+        )
+
+    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    val_bytes = load_validation_bytes(args.val_files, args.train_seq_len, args=args)
+    full_val_bytes = int(val_bytes.numel())
+    val_is_capped = False
+    if args.val_max_bytes > 0 and full_val_bytes > args.val_max_bytes:
+        capped_bytes = (args.val_max_bytes // args.train_seq_len) * args.train_seq_len
+        if capped_bytes <= 0:
+            raise ValueError(
+                f"VAL_MAX_BYTES={args.val_max_bytes} is too small for TRAIN_SEQ_LEN={args.train_seq_len}"
+            )
+        val_bytes = val_bytes[:capped_bytes].contiguous()
+        val_is_capped = True
+    log0(f"dataset_kind:pure_byte tokenizer_path:{args.tokenizer_path}")
+    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    log0(
+        f"val_loader:shards pattern={args.val_files} bytes:{val_bytes.numel()} "
+        f"full_bytes:{full_val_bytes} subset_only:{int(val_is_capped)}"
+    )
+
+    base_model = PureByteJEPA(
+        vocab_size=args.vocab_size,
+        byte_offset=args.byte_offset,
+        byte_count=args.byte_count,
+        seq_len=args.train_seq_len,
+        model_dim=args.model_dim,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        predictor_hidden_dim=args.predictor_hidden_dim,
+        predictor_num_layers=args.predictor_num_layers,
+        predictor_num_heads=args.predictor_num_heads,
+        predictor_input=args.predictor_input,
+        predictor_style=args.predictor_style,
+        action_dim=args.action_dim,
+        transition_hidden_dim=args.transition_hidden_dim,
+        predictor_model_layers=args.predictor_model_layers,
+        predictor_model_heads=args.predictor_model_heads,
+        predictor_model_mlp_hidden_dim=args.predictor_model_mlp_hidden_dim,
+        dropout=args.dropout,
+        target_ema_decay=args.target_ema_decay,
+        eval_logit_scale=args.eval_logit_scale,
+        jepa_loss=args.jepa_loss,
+        eval_bridge=args.eval_bridge,
+        target_codebook=args.target_codebook,
+        num_target_codebooks=args.num_target_codebooks,
+        contextual_target=args.contextual_target,
+        target_source=args.target_source,
+        target_encoder_causal=args.target_encoder_causal,
+        target_encoder_mode=args.target_encoder_mode,
+        target_stop_grad=args.target_stop_grad,
+        target_anchor_weight=args.target_anchor_weight,
+        prototype_ema_decay=args.prototype_ema_decay,
+        contextual_residual_scale=args.contextual_residual_scale,
+        contextual_aux_weight=args.contextual_aux_weight,
+        lm_probe_weight=args.lm_probe_weight,
+        lm_probe_input=args.lm_probe_input,
+        lm_probe_hidden_dim=args.lm_probe_hidden_dim,
+        encoder_unet_skip=args.encoder_unet_skip,
+        encoder_unet_skip_init=args.encoder_unet_skip_init,
+        target_future_steps=args.target_future_steps,
+        aux_target_future_steps=args.aux_target_future_steps,
+        aux_target_weight=args.aux_target_weight,
+        contextual_delta_normalization=args.contextual_delta_normalization,
+        contextual_delta_reference=args.contextual_delta_reference,
+        contextual_delta_whitening=args.contextual_delta_whitening,
+        contextual_delta_whiten_eps=args.contextual_delta_whiten_eps,
+        contextual_delta_span=args.contextual_delta_span,
+        contextual_delta_remove_topk=args.contextual_delta_remove_topk,
+        contextual_delta_l1_weight=args.contextual_delta_l1_weight,
+        contextual_state_projector=args.contextual_state_projector,
+        contextual_delta_parallel_weight=args.contextual_delta_parallel_weight,
+        contextual_delta_magnitude_weight=args.contextual_delta_magnitude_weight,
+        contextual_delta_teacher_orth_weight=args.contextual_delta_teacher_orth_weight,
+        contextual_delta_contrastive_teacher_anchor=args.contextual_delta_contrastive_teacher_anchor,
+        rotation_delta_loss_target=args.rotation_delta_loss_target,
+        additive_delta_normalization=args.additive_delta_normalization,
+        contrastive_weight=args.contrastive_weight,
+        contrastive_temperature=args.contrastive_temperature,
+        contrastive_samples=args.contrastive_samples,
+        contrastive_future_steps=args.contrastive_future_steps,
+        contrastive_mode=args.contrastive_mode,
+        var_reg_weight=args.var_reg_weight,
+        cov_reg_weight=args.cov_reg_weight,
+        target_var_reg_weight=args.target_var_reg_weight,
+        target_cov_reg_weight=args.target_cov_reg_weight,
+    ).to(device)
+    compiled_or_base: nn.Module = torch.compile(base_model, dynamic=False) if args.enable_torch_compile else base_model
+    model: nn.Module = DDP(compiled_or_base, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_or_base
+
+    optimizers = configure_optimizers(base_model, args)
+    if not isinstance(optimizers, list):
+        optimizers = [optimizers]
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["base_lr"] = group.get("lr", args.lr)
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"model_params:{n_params}")
+    log0(f"world_size:{world_size} grad_accum_steps:{args.grad_accum_steps}")
+    log0(
+        f"train_batch_bytes:{args.train_batch_bytes} train_seq_len:{args.train_seq_len} "
+        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"optimizer:{args.optimizer} embed_lr:{args.embed_lr:.6g} matrix_lr:{args.matrix_lr:.6g} "
+        f"scalar_lr:{args.scalar_lr:.6g} lm_probe_lr:{args.lm_probe_lr:.6g}"
+    )
+    log0(f"seed:{args.seed}")
+
+    train_loader = DistributedByteLoader(args.train_files, rank, world_size, device, args=args)
+
+    def zero_grad_all() -> None:
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    def optimizer_parameters(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
+        params: list[nn.Parameter] = []
+        seen: set[int] = set()
+        for group in opt.param_groups:
+            for param in group["params"]:
+                if not isinstance(param, nn.Parameter) or not param.requires_grad or id(param) in seen:
+                    continue
+                seen.add(id(param))
+                params.append(param)
+        return params
+
+    optimizer_param_sets = [optimizer_parameters(opt) for opt in optimizers]
+
+    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    def lr_mul(step: int, elapsed_ms: float) -> float:
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wallclock_ms is None:
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    if args.warmup_steps > 0:
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        model.train()
+        for warmup_step in range(args.warmup_steps):
+            zero_grad_all()
+            for micro_step in range(args.grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == args.grad_accum_steps - 1
+                batch = train_loader.next_batch(args.train_batch_bytes, args.train_seq_len, args.grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    warmup_metrics = model(batch)
+                (warmup_metrics["loss"] * grad_scale).backward()
+            for opt in optimizers:
+                opt.step()
+            base_model.update_target_encoder()
+            zero_grad_all()
+            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        base_model.load_state_dict(initial_model_state, strict=True)
+        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+            opt.load_state_dict(state)
+        zero_grad_all()
+        train_loader = DistributedByteLoader(args.train_files, rank, world_size, device, args=args)
+
+    training_time_ms = 0.0
+    stop_after_step: int | None = None
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    step = 0
+    while True:
+        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+
+        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        if should_validate:
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            val_metrics = eval_validation(
+                args,
+                model,
+                rank,
+                world_size,
+                device,
+                val_bytes,
+                full_validation=not val_is_capped,
+            )
+            if val_metrics["val_bpb"] is None:
+                subset_bpb = val_metrics["subset_val_bpb"]
+                subset_msg = f"val_bpb_subset:{subset_bpb:.6f} " if subset_bpb is not None else "val_bpb_subset:NA "
+                log0(
+                    f"step:{step}/{args.iterations} val_proxy_loss:{val_metrics['proxy_loss']:.6f} "
+                    f"{subset_msg}val_bpb:NA proxy_only:1 train_time:{training_time_ms:.0f}ms "
+                    f"step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                )
+            else:
+                log0(
+                    f"step:{step}/{args.iterations} val_proxy_loss:{val_metrics['proxy_loss']:.6f} "
+                    f"val_bpb:{val_metrics['val_bpb']:.6f} train_time:{training_time_ms:.0f}ms "
+                    f"step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                )
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if stop_after_step is not None and step < args.iterations:
+                log0(
+                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                    f"step:{step}/{args.iterations}"
+                )
+            break
+
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        scale = lr_mul(step, elapsed_ms)
+        zero_grad_all()
+        train_loss = torch.zeros((), device=device, dtype=torch.float64)
+        for micro_step in range(args.grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro_step == args.grad_accum_steps - 1
+            batch = train_loader.next_batch(args.train_batch_bytes, args.train_seq_len, args.grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                metrics = model(batch)
+            loss = metric_tensor(metrics["loss"], device, dtype=torch.float32)
+            train_loss += loss.detach().to(dtype=torch.float64)
+            (loss * grad_scale).backward()
+        train_loss /= args.grad_accum_steps
+
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"] * scale
+                if "momentum" in group:
+                    group["momentum"] = muon_momentum
+
+        if args.grad_clip_norm > 0:
+            for params in optimizer_param_sets:
+                if params:
+                    torch.nn.utils.clip_grad_norm_(params, args.grad_clip_norm)
+        for opt in optimizers:
+            opt.step()
+        base_model.update_target_encoder()
+        zero_grad_all()
+
+        step += 1
+        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        should_log_train = (
+            args.train_log_every > 0
+            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+        )
+        if should_log_train:
+            log0(
+                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.6f} "
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+            )
+
+        reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+        if distributed and max_wallclock_ms is not None:
+            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
+            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
+            reached_cap = bool(reached_cap_tensor.item())
+        if stop_after_step is None and reached_cap:
+            stop_after_step = step
+
+    log0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+
+    export_state = base_model.export_state_dict() if hasattr(base_model, "export_state_dict") else base_model.state_dict()
+    raw_model_path = run_dir / "final_model.pt"
+    quant_model_path = run_dir / "final_model.int8.ptz"
+    summary_path = run_dir / "summary.json"
+
+    if master_process:
+        torch.save(export_state, raw_model_path)
+        model_bytes = raw_model_path.stat().st_size
+        code_bytes = len(code.encode("utf-8")) + len(model_code.encode("utf-8"))
+        log0(f"Serialized model: {model_bytes} bytes")
+        log0(f"Code size: {code_bytes} bytes")
+        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state)
+    quant_buf = io.BytesIO()
+    torch.save(quant_obj, quant_buf)
+    quant_raw = quant_buf.getvalue()
+    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_raw_bytes = len(quant_raw)
+    if master_process:
+        with quant_model_path.open("wb") as f:
+            f.write(quant_blob)
+        quant_file_bytes = quant_model_path.stat().st_size
+        code_bytes = len(code.encode("utf-8")) + len(model_code.encode("utf-8"))
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log0(
+            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+        )
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+
+    if distributed:
+        dist.barrier()
+
+    with quant_model_path.open("rb") as f:
+        quant_blob_disk = f.read()
+    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    load_result = base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
+    if master_process and (load_result.missing_keys or load_result.unexpected_keys):
+        log0(
+            f"roundtrip_state_warnings missing_keys:{list(load_result.missing_keys)} "
+            f"unexpected_keys:{list(load_result.unexpected_keys)}"
+        )
+
+    torch.cuda.synchronize()
+    t_qeval = time.perf_counter()
+    q_val_metrics = eval_validation(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        val_bytes,
+        full_validation=not val_is_capped,
+    )
+    torch.cuda.synchronize()
+    eval_ms = 1000.0 * (time.perf_counter() - t_qeval)
+    if q_val_metrics["val_bpb"] is None:
+        subset_bpb = q_val_metrics["subset_val_bpb"]
+        subset_msg = f"val_bpb_subset:{subset_bpb:.6f} " if subset_bpb is not None else "val_bpb_subset:NA "
+        log0(
+            f"final_int8_zlib_roundtrip val_proxy_loss:{q_val_metrics['proxy_loss']:.6f} "
+            f"{subset_msg}val_bpb:NA proxy_only:1 eval_time:{eval_ms:.0f}ms"
+        )
+    else:
+        log0(
+            f"final_int8_zlib_roundtrip val_proxy_loss:{q_val_metrics['proxy_loss']:.6f} "
+            f"val_bpb:{q_val_metrics['val_bpb']:.8f} eval_time:{eval_ms:.0f}ms"
+        )
+
+    if master_process:
+        summary = {
+            "run_id": args.run_id,
+            "proxy_val_loss": q_val_metrics["proxy_loss"],
+            "subset_val_bpb": q_val_metrics["subset_val_bpb"],
+            "val_bpb": q_val_metrics["val_bpb"],
+            "proxy_only": q_val_metrics["val_bpb"] is None,
+            "validation_bytes": int(val_bytes.numel()),
+            "validation_full_bytes": full_val_bytes,
+            "artifact_model_bytes_int8_zlib": quant_model_path.stat().st_size,
+            "artifact_code_bytes": len(code.encode("utf-8")) + len(model_code.encode("utf-8")),
+            "artifact_total_bytes_int8_zlib": quant_model_path.stat().st_size + len(code.encode("utf-8")) + len(model_code.encode("utf-8")),
+        }
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    if distributed:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from baseline_gpt import Muon
+
+
+CONTROL_TENSOR_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "CONTROL_TENSOR_NAME_PATTERNS",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+    ).split(",")
+    if pattern
+)
+
+
+class EncoderBlock(nn.Module):
+    def __init__(self, model_dim: int, num_heads: int, mlp_hidden_dim: int, dropout: float):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(model_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=model_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(model_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(model_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, model_dim),
+        )
+
+    def forward(self, x: Tensor, attn_mask: Tensor | None) -> Tensor:
+        h = self.norm1(x)
+        attn_out, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class SequenceEncoder(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        model_dim: int,
+        num_layers: int,
+        num_heads: int,
+        mlp_hidden_dim: int,
+        max_seq_len: int,
+        dropout: float,
+        *,
+        causal: bool,
+        unet_skip: bool,
+        unet_skip_init: float,
+    ):
+        super().__init__()
+        self.causal = causal
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, model_dim))
+        self.use_unet_skip = bool(unet_skip)
+        self.blocks = nn.ModuleList(
+            [EncoderBlock(model_dim, num_heads, mlp_hidden_dim, dropout) for _ in range(num_layers)]
+        )
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers) if self.use_unet_skip else 0
+        if self.num_skip_weights > 0:
+            self.skip_weights = nn.Parameter(
+                torch.full((self.num_skip_weights, model_dim), float(unet_skip_init), dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("skip_weights", None)
+        self.norm = nn.LayerNorm(model_dim)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_emb, mean=0.0, std=0.01)
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        seq_len = token_ids.size(1)
+        x = self.tok_emb(token_ids) + self.pos_emb[:, :seq_len, :]
+        attn_mask = None
+        if self.causal:
+            attn_mask = torch.ones((seq_len, seq_len), device=token_ids.device, dtype=torch.bool).triu(diagonal=1)
+        if self.use_unet_skip and self.num_skip_weights > 0:
+            skips: list[Tensor] = []
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, attn_mask)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, attn_mask)
+        else:
+            for block in self.blocks:
+                x = block(x, attn_mask)
+        return self.norm(x)
+
+
+class Predictor(nn.Module):
+    def __init__(
+        self,
+        model_dim: int,
+        hidden_dim: int,
+        output_dim: int | None = None,
+        *,
+        num_layers: int = 0,
+        num_heads: int = 1,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        output_dim = model_dim if output_dim is None else output_dim
+        self.blocks = nn.ModuleList(
+            [EncoderBlock(model_dim, num_heads, hidden_dim, dropout) for _ in range(num_layers)]
+        )
+        self.net = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward_features(self, x: Tensor) -> Tensor:
+        if self.blocks:
+            seq_len = x.size(1)
+            attn_mask = torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool).triu(diagonal=1)
+            for block in self.blocks:
+                x = block(x, attn_mask)
+        return x
+
+    def forward_head(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.forward_head(self.forward_features(x))
+
+
+def _sylvester_hadamard(order: int) -> Tensor:
+    if order <= 0 or order & (order - 1):
+        raise ValueError(f"Hadamard order must be a positive power of two, got {order}")
+    h = torch.ones((1, 1), dtype=torch.float32)
+    while h.size(0) < order:
+        top = torch.cat((h, h), dim=1)
+        bottom = torch.cat((h, -h), dim=1)
+        h = torch.cat((top, bottom), dim=0)
+    return h
+
+
+def _build_fixed_codebook(
+    vocab_size: int,
+    byte_offset: int,
+    byte_count: int,
+    model_dim: int,
+    kind: str,
+    seed: int,
+) -> Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    codebook = torch.randn((vocab_size, model_dim), generator=generator, dtype=torch.float32)
+
+    if kind == "fixed_random":
+        return F.normalize(codebook, dim=-1, eps=1e-8)
+
+    if kind == "fixed_hadamard":
+        if model_dim < byte_count:
+            raise ValueError(
+                f"TARGET_CODEBOOK='fixed_hadamard' requires MODEL_DIM >= BYTE_COUNT; got {model_dim} < {byte_count}"
+            )
+        payload_codes = _sylvester_hadamard(byte_count)
+        if model_dim > byte_count:
+            payload_codes = F.pad(payload_codes, (0, model_dim - byte_count))
+        codebook[byte_offset : byte_offset + byte_count] = payload_codes
+        return F.normalize(codebook, dim=-1, eps=1e-8)
+
+    raise ValueError(f"Unknown TARGET_CODEBOOK={kind!r}")
+
+
+def _off_diagonal_mean_square(cov: Tensor) -> Tensor:
+    dim = cov.size(0)
+    if dim <= 1:
+        return cov.new_zeros(())
+    return cov.flatten()[:-1].view(dim - 1, dim + 1)[:, 1:].square().mean()
+
+
+def _orthogonal_residual(source: Tensor, anchor: Tensor) -> Tensor:
+    anchor_basis = F.normalize(anchor.float(), dim=-1, eps=1e-8)
+    source_float = source.float()
+    return source_float - (source_float * anchor_basis).sum(dim=-1, keepdim=True) * anchor_basis
+
+
+def _any_orthogonal_unit(anchor: Tensor) -> Tensor:
+    anchor_basis = F.normalize(anchor.float(), dim=-1, eps=1e-8)
+    idx = anchor_basis.abs().argmin(dim=-1, keepdim=True)
+    basis = torch.zeros_like(anchor_basis).scatter_(-1, idx, 1.0)
+    ortho = basis - (basis * anchor_basis).sum(dim=-1, keepdim=True) * anchor_basis
+    return F.normalize(ortho, dim=-1, eps=1e-8)
+
+
+def _rotation_scale_delta(source: Tensor, anchor: Tensor) -> Tensor:
+    anchor_float = anchor.float()
+    source_float = source.float()
+    anchor_norm = anchor_float.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    source_norm = source_float.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    anchor_dir = anchor_float / anchor_norm
+    source_dir = source_float / source_norm
+    cos_sim = (anchor_dir * source_dir).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+    tangent = source_dir - cos_sim * anchor_dir
+    sin_norm = tangent.norm(dim=-1, keepdim=True)
+    tangent_dir = tangent / sin_norm.clamp_min(1e-8)
+    antipodal = _any_orthogonal_unit(anchor_dir)
+    near_parallel = sin_norm < 1e-6
+    tangent_dir = torch.where((near_parallel & (cos_sim < 0.0)).expand_as(tangent_dir), antipodal, tangent_dir)
+    theta = torch.atan2(sin_norm, cos_sim)
+    theta = torch.where(near_parallel & (cos_sim < 0.0), torch.full_like(theta, float(torch.pi)), theta)
+    theta = torch.where(near_parallel & (cos_sim >= 0.0), torch.zeros_like(theta), theta)
+    log_scale = torch.log(source_norm / anchor_norm)
+    return theta * tangent_dir + log_scale * anchor_dir
+
+
+def _reconstruct_rotation_scale_next_state(anchor: Tensor, diff: Tensor) -> Tensor:
+    anchor_float = anchor.float()
+    diff_float = diff.float()
+    anchor_norm = anchor_float.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    anchor_dir = anchor_float / anchor_norm
+    log_scale = (diff_float * anchor_dir).sum(dim=-1, keepdim=True)
+    delta_rot = diff_float - log_scale * anchor_dir
+    theta = delta_rot.norm(dim=-1, keepdim=True)
+    tangent_dir = delta_rot / theta.clamp_min(1e-8)
+    next_dir = torch.cos(theta) * anchor_dir + torch.sin(theta) * tangent_dir
+    next_dir = torch.where((theta < 1e-6).expand_as(next_dir), anchor_dir, next_dir)
+    return anchor_norm * torch.exp(log_scale) * next_dir
+
+
+def _sphere_delta(source: Tensor, anchor: Tensor) -> Tensor:
+    anchor_dir = F.normalize(anchor.float(), dim=-1, eps=1e-8)
+    source_dir = F.normalize(source.float(), dim=-1, eps=1e-8)
+    return _orthogonal_residual(source_dir, anchor_dir)
+
+
+def _reconstruct_sphere_delta_next_state(anchor: Tensor, diff: Tensor) -> Tensor:
+    anchor_dir = F.normalize(anchor.float(), dim=-1, eps=1e-8)
+    tangent = _orthogonal_residual(diff.float(), anchor_dir)
+    tangent_norm = tangent.norm(dim=-1, keepdim=True)
+    max_norm = 1.0 - 1e-6
+    safe_scale = torch.where(
+        tangent_norm > max_norm,
+        torch.full_like(tangent_norm, max_norm) / tangent_norm.clamp_min(1e-8),
+        torch.ones_like(tangent_norm),
+    )
+    tangent = tangent * safe_scale
+    radial = torch.sqrt((1.0 - tangent.square().sum(dim=-1, keepdim=True)).clamp_min(1e-8))
+    return radial * anchor_dir + tangent
+
+
+def _reconstruct_additive_delta_next_state(
+    anchor: Tensor,
+    diff: Tensor,
+    *,
+    normalize_anchor: bool,
+    normalize_output: bool,
+) -> Tensor:
+    anchor_repr = anchor.float()
+    if normalize_anchor:
+        anchor_repr = F.normalize(anchor_repr, dim=-1, eps=1e-8)
+    next_state = anchor_repr + diff.float()
+    if normalize_output:
+        next_state = F.normalize(next_state, dim=-1, eps=1e-8)
+    return next_state
+
+
+def _reconstruct_contextual_delta_next_state(anchor: Tensor, diff: Tensor, parallel_shift: Tensor) -> Tensor:
+    anchor_float = anchor.float()
+    anchor_basis = F.normalize(anchor_float, dim=-1, eps=1e-8)
+    anchor_norm = anchor_float.norm(dim=-1, keepdim=True)
+    orth_diff = _orthogonal_residual(diff.float(), anchor_float)
+    return (anchor_norm + parallel_shift.float()) * anchor_basis + orth_diff
+
+
+def _scaled_contextual_delta(diff: Tensor, anchor: Tensor, log_norm: Tensor) -> Tensor:
+    orth_diff = _orthogonal_residual(diff.float(), anchor.float())
+    diff_dir = F.normalize(orth_diff, dim=-1, eps=1e-8)
+    return diff_dir * torch.exp(log_norm.float())
+
+
+def _diagonal_whiten(x: Tensor, eps: float) -> Tensor:
+    flat = x.float().reshape(-1, x.size(-1))
+    mean = flat.mean(dim=0, keepdim=True)
+    var = flat.var(dim=0, unbiased=False, keepdim=True)
+    whitened = (x.float() - mean) / torch.sqrt(var + eps)
+    return whitened.to(dtype=x.dtype)
+
+
+def _remove_top_pcs(x: Tensor, topk: int) -> Tensor:
+    if topk <= 0:
+        return x
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        flat = x.detach().float().reshape(-1, x.size(-1))
+        mean = flat.mean(dim=0, keepdim=True)
+        centered = flat - mean
+        cov = centered.T @ centered / max(flat.size(0) - 1, 1)
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        k = min(int(topk), eigvecs.size(1))
+        if k <= 0:
+            return x
+        top = eigvecs[:, -k:]
+        centered_x = x.float() - mean
+        filtered = centered_x - (centered_x @ top) @ top.T
+        out = filtered + mean
+    return out.to(dtype=x.dtype)
+
+
+def _project_out_basis(x: Tensor, basis: Tensor, eps: float = 1e-4) -> Tensor:
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        basis_matrix = basis.float().transpose(-1, -2)
+        basis_t = basis_matrix.transpose(-1, -2)
+        eye = torch.eye(basis_matrix.size(-1), device=basis_matrix.device, dtype=basis_matrix.dtype)
+        gram = basis_t @ basis_matrix
+        rhs = basis_t @ x.float().unsqueeze(-1)
+        coeff = torch.linalg.solve(gram + eps * eye, rhs)
+        proj = (basis_matrix @ coeff).squeeze(-1)
+        out = x.float() - proj
+    return out.to(dtype=x.dtype)
+
+
+class PureByteJEPA(nn.Module):
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        byte_offset: int,
+        byte_count: int,
+        seq_len: int,
+        model_dim: int,
+        num_layers: int,
+        num_heads: int,
+        mlp_hidden_dim: int,
+        predictor_hidden_dim: int,
+        predictor_num_layers: int,
+        predictor_num_heads: int,
+        predictor_input: str,
+        predictor_style: str,
+        action_dim: int,
+        transition_hidden_dim: int,
+        predictor_model_layers: int,
+        predictor_model_heads: int,
+        predictor_model_mlp_hidden_dim: int,
+        dropout: float,
+        target_ema_decay: float,
+        eval_logit_scale: float,
+        jepa_loss: str,
+        eval_bridge: str,
+        target_codebook: str,
+        num_target_codebooks: int,
+        contextual_target: bool,
+        target_source: str,
+        target_encoder_causal: bool,
+        target_encoder_mode: str,
+        target_stop_grad: bool,
+        target_anchor_weight: float,
+        prototype_ema_decay: float,
+        contextual_residual_scale: float,
+        contextual_aux_weight: float,
+        lm_probe_weight: float,
+        lm_probe_input: str,
+        lm_probe_hidden_dim: int,
+        encoder_unet_skip: bool,
+        encoder_unet_skip_init: float,
+        target_future_steps: int,
+        aux_target_future_steps: str,
+        aux_target_weight: float,
+        contextual_delta_normalization: str,
+        contextual_delta_reference: str,
+        contextual_delta_whitening: str,
+        contextual_delta_whiten_eps: float,
+        contextual_delta_span: int,
+        contextual_delta_remove_topk: int,
+        contextual_delta_l1_weight: float,
+        contextual_state_projector: str,
+        contextual_delta_parallel_weight: float,
+        contextual_delta_magnitude_weight: float,
+        contextual_delta_teacher_orth_weight: float,
+        contextual_delta_contrastive_teacher_anchor: bool,
+        rotation_delta_loss_target: str,
+        additive_delta_normalization: str,
+        contrastive_weight: float,
+        contrastive_temperature: float,
+        contrastive_samples: int,
+        contrastive_future_steps: int,
+        contrastive_mode: str,
+        var_reg_weight: float,
+        cov_reg_weight: float,
+        target_var_reg_weight: float,
+        target_cov_reg_weight: float,
+    ):
+        super().__init__()
+        if num_target_codebooks <= 0:
+            raise ValueError(f"NUM_TARGET_CODEBOOKS must be positive, got {num_target_codebooks}")
+        if predictor_input not in {"context_latent", "tokens", "context_plus_tokens"}:
+            raise ValueError(f"Unknown PREDICTOR_INPUT={predictor_input!r}")
+        if predictor_style not in {"direct", "action_transition"}:
+            raise ValueError(f"Unknown PREDICTOR_STYLE={predictor_style!r}")
+        if target_source not in {"codebook", "contextual_only", "contextual_delta", "rotation_scale_delta", "sphere_delta", "additive_delta"}:
+            raise ValueError(f"Unknown TARGET_SOURCE={target_source!r}")
+        if target_encoder_mode not in {"ema", "shared"}:
+            raise ValueError(f"Unknown TARGET_ENCODER_MODE={target_encoder_mode!r}")
+        if lm_probe_input not in {
+            "pred_target",
+            "pred_residual",
+            "context_plus_pred",
+            "context_plus_scaled_pred",
+            "context_plus_pred_parallel",
+            "context_plus_pred_magnitude",
+            "action",
+            "context_plus_action",
+        }:
+            raise ValueError(f"Unknown LM_PROBE_INPUT={lm_probe_input!r}")
+        if target_future_steps <= 0:
+            raise ValueError(f"TARGET_FUTURE_STEPS must be positive, got {target_future_steps}")
+        if encoder_unet_skip_init < 0:
+            raise ValueError(f"ENCODER_UNET_SKIP_INIT must be non-negative, got {encoder_unet_skip_init}")
+        if aux_target_weight < 0:
+            raise ValueError(f"AUX_TARGET_WEIGHT must be non-negative, got {aux_target_weight}")
+        if contextual_delta_normalization not in {"normalized", "raw"}:
+            raise ValueError(f"Unknown CONTEXTUAL_DELTA_NORMALIZATION={contextual_delta_normalization!r}")
+        if contextual_delta_reference not in {"anchor", "stepwise"}:
+            raise ValueError(f"Unknown CONTEXTUAL_DELTA_REFERENCE={contextual_delta_reference!r}")
+        if contextual_delta_whitening not in {"none", "diag"}:
+            raise ValueError(f"Unknown CONTEXTUAL_DELTA_WHITENING={contextual_delta_whitening!r}")
+        if contextual_delta_whiten_eps <= 0:
+            raise ValueError(f"CONTEXTUAL_DELTA_WHITEN_EPS must be positive, got {contextual_delta_whiten_eps}")
+        if contextual_delta_span <= 0:
+            raise ValueError(f"CONTEXTUAL_DELTA_SPAN must be positive, got {contextual_delta_span}")
+        if contextual_delta_remove_topk < 0:
+            raise ValueError(f"CONTEXTUAL_DELTA_REMOVE_TOPK must be non-negative, got {contextual_delta_remove_topk}")
+        if contextual_delta_l1_weight < 0:
+            raise ValueError(f"CONTEXTUAL_DELTA_L1_WEIGHT must be non-negative, got {contextual_delta_l1_weight}")
+        if contextual_state_projector not in {"none", "linear"}:
+            raise ValueError(f"Unknown CONTEXTUAL_STATE_PROJECTOR={contextual_state_projector!r}")
+        if contextual_delta_parallel_weight < 0:
+            raise ValueError(
+                f"CONTEXTUAL_DELTA_PARALLEL_WEIGHT must be non-negative, got {contextual_delta_parallel_weight}"
+            )
+        if contextual_delta_magnitude_weight < 0:
+            raise ValueError(
+                f"CONTEXTUAL_DELTA_MAGNITUDE_WEIGHT must be non-negative, got {contextual_delta_magnitude_weight}"
+            )
+        if contextual_delta_teacher_orth_weight < 0:
+            raise ValueError(
+                f"CONTEXTUAL_DELTA_TEACHER_ORTH_WEIGHT must be non-negative, got {contextual_delta_teacher_orth_weight}"
+            )
+        if rotation_delta_loss_target not in {"diff", "next_state"}:
+            raise ValueError(f"Unknown ROTATION_DELTA_LOSS_TARGET={rotation_delta_loss_target!r}")
+        if additive_delta_normalization not in {"none", "states", "diff", "states_and_diff"}:
+            raise ValueError(f"Unknown ADDITIVE_DELTA_NORMALIZATION={additive_delta_normalization!r}")
+        if contrastive_temperature <= 0:
+            raise ValueError(f"CONTRASTIVE_TEMPERATURE must be positive, got {contrastive_temperature}")
+        if contrastive_samples < 0:
+            raise ValueError(f"CONTRASTIVE_SAMPLES must be non-negative, got {contrastive_samples}")
+        if contrastive_future_steps <= 0:
+            raise ValueError(f"CONTRASTIVE_FUTURE_STEPS must be positive, got {contrastive_future_steps}")
+        if contrastive_mode not in {"delta", "future_state"}:
+            raise ValueError(f"Unknown CONTRASTIVE_MODE={contrastive_mode!r}")
+        if contextual_target and num_target_codebooks != 1:
+            raise ValueError("CONTEXTUAL_TARGET=1 currently requires NUM_TARGET_CODEBOOKS=1")
+        if target_source in {"contextual_only", "contextual_delta", "rotation_scale_delta", "sphere_delta", "additive_delta"} and num_target_codebooks != 1:
+            raise ValueError("TARGET_SOURCE contextual variants currently require NUM_TARGET_CODEBOOKS=1")
+        if target_codebook == "ema" and num_target_codebooks != 1:
+            raise ValueError("TARGET_CODEBOOK='ema' only supports NUM_TARGET_CODEBOOKS=1")
+        if predictor_style == "action_transition" and action_dim <= 0:
+            raise ValueError(f"ACTION_DIM must be positive for action_transition, got {action_dim}")
+        if lm_probe_input in {"action", "context_plus_action"} and predictor_style != "action_transition":
+            raise ValueError(f"LM_PROBE_INPUT={lm_probe_input!r} requires PREDICTOR_STYLE='action_transition'")
+        self.vocab_size = vocab_size
+        self.byte_offset = byte_offset
+        self.byte_count = byte_count
+        self.byte_token_max = byte_offset + byte_count
+        self.seq_len = seq_len
+        self.target_ema_decay = target_ema_decay
+        self.eval_logit_scale = float(eval_logit_scale)
+        self.jepa_loss = jepa_loss
+        self.eval_bridge = eval_bridge
+        self.target_codebook = target_codebook
+        self.num_target_codebooks = num_target_codebooks
+        self.contextual_target = contextual_target
+        self.target_source = target_source
+        self.target_encoder_causal = target_encoder_causal
+        self.target_encoder_mode = target_encoder_mode
+        self.target_stop_grad = bool(target_stop_grad)
+        self.target_anchor_weight = float(target_anchor_weight)
+        self.prototype_ema_decay = float(prototype_ema_decay)
+        self.contextual_residual_scale = float(contextual_residual_scale)
+        self.contextual_aux_weight = float(contextual_aux_weight)
+        self.lm_probe_weight = float(lm_probe_weight)
+        self.lm_probe_input = lm_probe_input
+        self.lm_probe_hidden_dim = int(lm_probe_hidden_dim)
+        self.encoder_unet_skip = bool(encoder_unet_skip)
+        self.encoder_unet_skip_init = float(encoder_unet_skip_init)
+        self.target_future_steps = int(target_future_steps)
+        aux_steps: list[int] = []
+        for raw_part in aux_target_future_steps.split(","):
+            part = raw_part.strip()
+            if not part:
+                continue
+            step = int(part)
+            if step <= 0:
+                raise ValueError(f"AUX_TARGET_FUTURE_STEPS entries must be positive, got {step}")
+            aux_steps.append(step)
+        self.aux_target_future_steps = tuple(aux_steps)
+        self.aux_target_weight = float(aux_target_weight)
+        self.contextual_delta_normalization = contextual_delta_normalization
+        self.contextual_delta_reference = contextual_delta_reference
+        self.contextual_delta_whitening = contextual_delta_whitening
+        self.contextual_delta_whiten_eps = float(contextual_delta_whiten_eps)
+        self.contextual_delta_span = int(contextual_delta_span)
+        self.contextual_delta_remove_topk = int(contextual_delta_remove_topk)
+        self.contextual_delta_l1_weight = float(contextual_delta_l1_weight)
+        self.contextual_state_projector_kind = contextual_state_projector
+        self.contextual_delta_parallel_weight = float(contextual_delta_parallel_weight)
+        self.contextual_delta_magnitude_weight = float(contextual_delta_magnitude_weight)
+        self.contextual_delta_teacher_orth_weight = float(contextual_delta_teacher_orth_weight)
+        self.contextual_delta_contrastive_teacher_anchor = bool(contextual_delta_contrastive_teacher_anchor)
+        self.rotation_delta_loss_target = rotation_delta_loss_target
+        self.additive_delta_normalization = additive_delta_normalization
+        self.contrastive_weight = float(contrastive_weight)
+        self.contrastive_temperature = float(contrastive_temperature)
+        self.contrastive_samples = int(contrastive_samples)
+        self.contrastive_future_steps = int(contrastive_future_steps)
+        self.contrastive_mode = contrastive_mode
+        self.var_reg_weight = float(var_reg_weight)
+        self.cov_reg_weight = float(cov_reg_weight)
+        self.target_var_reg_weight = float(target_var_reg_weight)
+        self.target_cov_reg_weight = float(target_cov_reg_weight)
+        self.predictor_input = predictor_input
+        self.predictor_style = predictor_style
+        self.action_dim = int(action_dim)
+        self.transition_hidden_dim = int(transition_hidden_dim)
+        self.uses_anchor_codebook = self.target_source == "codebook"
+        self.online_state_projector: nn.Module | None = None
+        self.target_state_projector: nn.Module | None = None
+
+        self.online_encoder = SequenceEncoder(
+            vocab_size=vocab_size,
+            model_dim=model_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            mlp_hidden_dim=mlp_hidden_dim,
+            max_seq_len=seq_len,
+            dropout=dropout,
+            causal=True,
+            unet_skip=self.encoder_unet_skip,
+            unet_skip_init=self.encoder_unet_skip_init,
+        )
+        self.target_encoder: SequenceEncoder | None = None
+        needs_target_encoder = (
+            self.contextual_target
+            or self.contextual_aux_weight > 0.0
+            or self.target_source in {"contextual_only", "contextual_delta", "rotation_scale_delta", "sphere_delta", "additive_delta"}
+        )
+        if self.target_encoder_mode == "ema" and needs_target_encoder:
+            self.target_encoder = SequenceEncoder(
+                vocab_size=vocab_size,
+                model_dim=model_dim,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                mlp_hidden_dim=mlp_hidden_dim,
+                max_seq_len=seq_len,
+                dropout=dropout,
+                causal=target_encoder_causal,
+                unet_skip=self.encoder_unet_skip,
+                unet_skip_init=self.encoder_unet_skip_init,
+            )
+            self.target_encoder.load_state_dict(self.online_encoder.state_dict(), strict=True)
+            for param in self.target_encoder.parameters():
+                param.requires_grad_(False)
+        if self.contextual_state_projector_kind == "linear":
+            online_proj = nn.Linear(model_dim, model_dim, bias=False)
+            with torch.no_grad():
+                online_proj.weight.copy_(torch.eye(model_dim, dtype=online_proj.weight.dtype))
+            self.online_state_projector = online_proj
+            if self.target_encoder_mode == "ema" and needs_target_encoder:
+                target_proj = nn.Linear(model_dim, model_dim, bias=False)
+                target_proj.load_state_dict(self.online_state_projector.state_dict(), strict=True)
+                for param in target_proj.parameters():
+                    param.requires_grad_(False)
+                self.target_state_projector = target_proj
+
+        self.target_codebooks = nn.Parameter(
+            torch.empty(num_target_codebooks, vocab_size, model_dim),
+            requires_grad=False,
+        )
+        self.eval_codebooks = nn.Parameter(
+            torch.empty(num_target_codebooks, vocab_size, model_dim),
+            requires_grad=False,
+        )
+        with torch.no_grad():
+            if self.uses_anchor_codebook:
+                if self.target_codebook == "ema":
+                    self.target_codebooks[0].copy_(self.online_encoder.tok_emb.weight)
+                else:
+                    for codebook_idx in range(self.num_target_codebooks):
+                        self.target_codebooks[codebook_idx].copy_(
+                            _build_fixed_codebook(
+                                vocab_size,
+                                byte_offset,
+                                byte_count,
+                                model_dim,
+                                self.target_codebook,
+                                seed=codebook_idx,
+                            )
+                        )
+                self.eval_codebooks.copy_(self.target_codebooks)
+            else:
+                self.target_codebooks.zero_()
+                self.eval_codebooks.zero_()
+
+        self.predictor_encoder: SequenceEncoder | None = None
+        self.predictor_fusion: nn.Module | None = None
+        if self.predictor_input in {"tokens", "context_plus_tokens"}:
+            self.predictor_encoder = SequenceEncoder(
+                vocab_size=vocab_size,
+                model_dim=model_dim,
+                num_layers=predictor_model_layers,
+                num_heads=predictor_model_heads,
+                mlp_hidden_dim=predictor_model_mlp_hidden_dim,
+                max_seq_len=seq_len,
+                dropout=dropout,
+                causal=True,
+                unet_skip=False,
+                unet_skip_init=1.0,
+            )
+            if self.predictor_input == "context_plus_tokens":
+                self.predictor_fusion = nn.Sequential(
+                    nn.LayerNorm(2 * model_dim),
+                    nn.Linear(2 * model_dim, model_dim),
+                    nn.GELU(),
+                    nn.Linear(model_dim, model_dim),
+                )
+        self.predictor: nn.Module | None = None
+        self.action_head: nn.Module | None = None
+        self.transition_head: nn.Module | None = None
+        self.contextual_delta_parallel_head: nn.Module | None = None
+        self.contextual_delta_magnitude_head: nn.Module | None = None
+        if self.predictor_style == "action_transition":
+            self.action_head = nn.Sequential(
+                nn.LayerNorm(model_dim),
+                nn.Linear(model_dim, predictor_hidden_dim),
+                nn.GELU(),
+                nn.Linear(predictor_hidden_dim, self.action_dim),
+            )
+            self.transition_head = nn.Sequential(
+                nn.LayerNorm(model_dim + self.action_dim),
+                nn.Linear(model_dim + self.action_dim, self.transition_hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.transition_hidden_dim, model_dim),
+            )
+        else:
+            self.predictor = Predictor(
+                model_dim=model_dim,
+                hidden_dim=predictor_hidden_dim,
+                output_dim=model_dim * self.num_target_codebooks,
+                num_layers=predictor_num_layers,
+                num_heads=predictor_num_heads,
+                dropout=dropout,
+            )
+            if self.target_source == "contextual_delta" and self.contextual_delta_parallel_weight > 0.0:
+                self.contextual_delta_parallel_head = nn.Sequential(
+                    nn.LayerNorm(model_dim),
+                    nn.Linear(model_dim, predictor_hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(predictor_hidden_dim, self.num_target_codebooks),
+                )
+            if self.target_source == "contextual_delta" and self.contextual_delta_magnitude_weight > 0.0:
+                self.contextual_delta_magnitude_head = nn.Sequential(
+                    nn.LayerNorm(model_dim),
+                    nn.Linear(model_dim, predictor_hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(predictor_hidden_dim, self.num_target_codebooks),
+                )
+        self.contextual_predictor: Predictor | None = None
+        if self.contextual_aux_weight > 0.0:
+            self.contextual_predictor = Predictor(
+                model_dim=model_dim,
+                hidden_dim=predictor_hidden_dim,
+                num_layers=predictor_num_layers,
+                num_heads=predictor_num_heads,
+                dropout=dropout,
+            )
+        self.future_aux_heads = nn.ModuleDict()
+        if self.predictor_style == "direct" and self.aux_target_future_steps:
+            output_dim = model_dim * self.num_target_codebooks
+            for step in self.aux_target_future_steps:
+                self.future_aux_heads[str(step)] = nn.Sequential(
+                    nn.LayerNorm(model_dim),
+                    nn.Linear(model_dim, predictor_hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(predictor_hidden_dim, output_dim),
+                )
+
+        self.lm_head: nn.Module | None = None
+        if self.lm_probe_weight > 0.0:
+            if self.lm_probe_input in {"pred_target", "pred_residual"}:
+                lm_probe_feature_dim = model_dim * self.num_target_codebooks
+            elif self.lm_probe_input in {"context_plus_pred", "context_plus_scaled_pred"}:
+                lm_probe_feature_dim = 2 * model_dim * self.num_target_codebooks
+            elif self.lm_probe_input == "context_plus_pred_parallel":
+                lm_probe_feature_dim = (2 * model_dim + 1) * self.num_target_codebooks
+            elif self.lm_probe_input == "context_plus_pred_magnitude":
+                lm_probe_feature_dim = (2 * model_dim + 1) * self.num_target_codebooks
+            elif self.lm_probe_input == "action":
+                lm_probe_feature_dim = self.action_dim
+            else:
+                lm_probe_feature_dim = model_dim + self.action_dim
+            lm_layers: list[nn.Module] = [nn.LayerNorm(lm_probe_feature_dim)]
+            if self.lm_probe_hidden_dim > 0:
+                lm_layers.extend([
+                    nn.Linear(lm_probe_feature_dim, self.lm_probe_hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(self.lm_probe_hidden_dim, vocab_size),
+                ])
+            else:
+                lm_layers.append(nn.Linear(lm_probe_feature_dim, vocab_size))
+            self.lm_head = nn.Sequential(*lm_layers)
+
+    def forward(self, byte_ids: Tensor, return_validation: bool = False) -> dict[str, Tensor]:
+        if return_validation:
+            return self.validation_step(byte_ids)
+        return self.training_step(byte_ids)
+
+    def _split_inputs_and_targets(self, byte_ids: Tensor) -> tuple[Tensor, Tensor]:
+        if byte_ids.ndim != 2:
+            raise ValueError(f"Expected [batch, seq] byte ids, got {tuple(byte_ids.shape)}")
+        if byte_ids.size(1) < 2:
+            raise ValueError("Sequence length must be at least 2 for next-byte JEPA")
+        return byte_ids[:, :-1], byte_ids[:, 1:]
+
+    def _payload_mask(self, target_ids: Tensor) -> Tensor:
+        return (target_ids >= self.byte_offset) & (target_ids < self.byte_token_max)
+
+    def _anchor_targets(self, target_ids: Tensor) -> Tensor:
+        if not self.uses_anchor_codebook:
+            raise RuntimeError("Anchor targets requested for a contextual-only target source")
+        with torch.no_grad():
+            return torch.stack(
+                [F.embedding(target_ids, self.target_codebooks[i]) for i in range(self.num_target_codebooks)],
+                dim=2,
+            )
+
+    def _contextual_residual_targets(self, anchor_targets: Tensor, contextual_targets: Tensor) -> Tensor:
+        anchor_repr = F.normalize(anchor_targets.float(), dim=-1, eps=1e-8)
+        residual = _orthogonal_residual(contextual_targets, anchor_targets)
+        residual_dir = residual / residual.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        target_repr = F.normalize(anchor_repr + self.contextual_residual_scale * residual_dir, dim=-1, eps=1e-8)
+        return target_repr.to(dtype=anchor_targets.dtype)
+
+    def _contextual_delta_targets(self, contextual_states: Tensor, *, steps: int = 1) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if self.contextual_delta_whitening == "diag":
+            contextual_states = _diagonal_whiten(contextual_states, self.contextual_delta_whiten_eps)
+        if self.contextual_delta_remove_topk > 0:
+            contextual_states = _remove_top_pcs(contextual_states, self.contextual_delta_remove_topk)
+        if self.contextual_delta_reference == "stepwise" and steps > 1:
+            prev_targets = contextual_states[:, steps - 1 : -1, :].unsqueeze(2)
+        else:
+            prev_targets = contextual_states[:, :-steps, :].unsqueeze(2)
+        next_targets = contextual_states[:, steps:, :].unsqueeze(2)
+        prev_basis = F.normalize(prev_targets.float(), dim=-1, eps=1e-8)
+        parallel_coeff = (next_targets.float() * prev_basis).sum(dim=-1, keepdim=True)
+        prev_norm = prev_targets.float().norm(dim=-1, keepdim=True)
+        if self.contextual_delta_reference == "anchor" and self.contextual_delta_span > 1:
+            base_len = contextual_states.size(1) - steps
+            index_base = torch.arange(base_len, device=contextual_states.device)
+            basis_stack = []
+            for offset in range(self.contextual_delta_span):
+                gather_idx = (index_base - offset).clamp_min(0)
+                basis_stack.append(contextual_states.index_select(1, gather_idx))
+            basis = torch.stack(basis_stack, dim=2)
+            delta_targets = _project_out_basis(next_targets.squeeze(2), basis).unsqueeze(2)
+        else:
+            delta_targets = next_targets.float() - parallel_coeff * prev_basis
+        delta_norm = delta_targets.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        parallel_shift = parallel_coeff - prev_norm
+        delta_log_norm = torch.log(delta_norm)
+        if self.contextual_delta_normalization == "normalized":
+            delta_targets = delta_targets / delta_norm
+        return (
+            next_targets,
+            delta_targets.to(dtype=next_targets.dtype),
+            parallel_shift.to(dtype=next_targets.dtype),
+            delta_log_norm.to(dtype=next_targets.dtype),
+        )
+
+    def _rotation_scale_delta_targets(self, contextual_states: Tensor, *, steps: int = 1) -> tuple[Tensor, Tensor]:
+        prev_targets = contextual_states[:, :-steps, :].unsqueeze(2)
+        next_targets = contextual_states[:, steps:, :].unsqueeze(2)
+        delta_targets = _rotation_scale_delta(next_targets, prev_targets)
+        return next_targets, delta_targets.to(dtype=next_targets.dtype)
+
+    def _sphere_delta_targets(self, contextual_states: Tensor, *, steps: int = 1) -> tuple[Tensor, Tensor]:
+        prev_targets = contextual_states[:, :-steps, :].unsqueeze(2)
+        next_targets = contextual_states[:, steps:, :].unsqueeze(2)
+        prev_unit = F.normalize(prev_targets.float(), dim=-1, eps=1e-8)
+        next_unit = F.normalize(next_targets.float(), dim=-1, eps=1e-8)
+        delta_targets = _sphere_delta(next_unit, prev_unit)
+        return next_unit.to(dtype=next_targets.dtype), delta_targets.to(dtype=next_targets.dtype)
+
+    def _additive_delta_targets(self, contextual_states: Tensor, *, steps: int = 1) -> tuple[Tensor, Tensor]:
+        prev_targets = contextual_states[:, :-steps, :].unsqueeze(2).float()
+        next_targets = contextual_states[:, steps:, :].unsqueeze(2).float()
+        if self.additive_delta_normalization in {"states", "states_and_diff"}:
+            prev_repr = F.normalize(prev_targets, dim=-1, eps=1e-8)
+            next_repr = F.normalize(next_targets, dim=-1, eps=1e-8)
+        else:
+            prev_repr = prev_targets
+            next_repr = next_targets
+        delta_targets = next_repr - prev_repr
+        if self.additive_delta_normalization in {"diff", "states_and_diff"}:
+            delta_targets = F.normalize(delta_targets, dim=-1, eps=1e-8)
+        return next_repr.to(dtype=next_targets.dtype), delta_targets.to(dtype=next_targets.dtype)
+
+    def _encode_target_states(self, byte_ids: Tensor) -> Tensor:
+        encoder: SequenceEncoder | None
+        projector: nn.Module | None
+        if self.target_encoder_mode == "shared":
+            encoder = self.online_encoder
+            projector = self.online_state_projector
+        else:
+            encoder = self.target_encoder
+            projector = self.target_state_projector
+        if encoder is None:
+            raise RuntimeError("Contextual target source requested without an available target encoder")
+        if self.target_stop_grad:
+            with torch.no_grad():
+                states = encoder(byte_ids)
+                if projector is not None:
+                    states = projector(states)
+                return states
+        states = encoder(byte_ids)
+        if projector is not None:
+            states = projector(states)
+        return states
+
+    def _contrastive_infonce_loss(
+        self,
+        pred_target: Tensor,
+        pred_parallel: Tensor | None,
+        pred_magnitude: Tensor | None,
+        context_latents: Tensor,
+        teacher_states: Tensor | None,
+        payload_mask: Tensor,
+    ) -> Tensor:
+        if self.contrastive_weight <= 0.0 or self.contrastive_samples == 0 or teacher_states is None:
+            return pred_target.new_zeros(())
+        if teacher_states.size(1) <= self.contrastive_future_steps:
+            return pred_target.new_zeros(())
+        if self.contrastive_mode == "future_state":
+            key = teacher_states[:, self.contrastive_future_steps :, :].unsqueeze(2).float()
+            context_anchor = context_latents[:, : key.size(1)].unsqueeze(2).float()
+            teacher_anchor = teacher_states[:, : key.size(1), :].unsqueeze(2).float()
+            delta_anchor = teacher_anchor if self.contextual_delta_contrastive_teacher_anchor else context_anchor
+            if self.target_source == "contextual_only":
+                query = pred_target[:, : key.size(1)].float()
+            elif self.target_source == "rotation_scale_delta":
+                query = _reconstruct_rotation_scale_next_state(
+                    context_anchor,
+                    pred_target[:, : key.size(1)],
+                ).float()
+            elif self.target_source == "sphere_delta":
+                query = _reconstruct_sphere_delta_next_state(
+                    context_anchor,
+                    pred_target[:, : key.size(1)],
+                ).float()
+            elif self.target_source == "additive_delta":
+                query = _reconstruct_additive_delta_next_state(
+                    context_anchor,
+                    pred_target[:, : key.size(1)],
+                    normalize_anchor=self.additive_delta_normalization in {"states", "states_and_diff"},
+                    normalize_output=self.additive_delta_normalization in {"states", "states_and_diff"},
+                ).float()
+            elif self.target_source == "contextual_delta" and pred_parallel is not None:
+                query = _reconstruct_contextual_delta_next_state(
+                    delta_anchor,
+                    pred_target[:, : key.size(1)],
+                    pred_parallel[:, : key.size(1)],
+                ).float()
+            elif self.target_source == "contextual_delta" and pred_magnitude is not None:
+                scaled_delta = _scaled_contextual_delta(
+                    pred_target[:, : key.size(1)],
+                    delta_anchor,
+                    pred_magnitude[:, : key.size(1)],
+                )
+                query = delta_anchor + scaled_delta
+            else:
+                query = delta_anchor + pred_target[:, : key.size(1)].float()
+        else:
+            if self.target_source == "rotation_scale_delta":
+                _, contrastive_targets = self._rotation_scale_delta_targets(teacher_states, steps=self.contrastive_future_steps)
+            elif self.target_source == "sphere_delta":
+                _, contrastive_targets = self._sphere_delta_targets(teacher_states, steps=self.contrastive_future_steps)
+            elif self.target_source == "additive_delta":
+                _, contrastive_targets = self._additive_delta_targets(teacher_states, steps=self.contrastive_future_steps)
+            else:
+                _, contrastive_targets, _, _ = self._contextual_delta_targets(teacher_states, steps=self.contrastive_future_steps)
+            query = pred_target[:, : contrastive_targets.size(1)].float()
+            key = contrastive_targets.float()
+        mask = payload_mask[:, : key.size(1)].reshape(-1)
+        if int(mask.to(dtype=torch.int32).sum().item()) <= 1:
+            return pred_target.new_zeros(())
+        flat_query = query[:, : key.size(1)].reshape(-1, query.size(-2) * query.size(-1))[mask]
+        flat_key = key.reshape(-1, key.size(-2) * key.size(-1))[mask]
+        if flat_query.size(0) <= 1:
+            return pred_target.new_zeros(())
+        sample_count = min(self.contrastive_samples, flat_query.size(0))
+        if sample_count < flat_query.size(0):
+            sample_idx = torch.randperm(flat_query.size(0), device=flat_query.device)[:sample_count]
+            flat_query = flat_query[sample_idx]
+            flat_key = flat_key[sample_idx]
+        query_repr = F.normalize(flat_query, dim=-1, eps=1e-8)
+        key_repr = F.normalize(flat_key, dim=-1, eps=1e-8)
+        logits = (query_repr @ key_repr.T) / self.contrastive_temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return F.cross_entropy(logits, labels)
+
+    def _predict_target_latents(
+        self, byte_ids: Tensor
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        dict[int, Tensor] | None,
+        Tensor | None,
+        Tensor | None,
+        Tensor | None,
+        Tensor,
+        Tensor | None,
+        Tensor | None,
+        Tensor | None,
+        Tensor | None,
+    ]:
+        context_ids, target_ids = self._split_inputs_and_targets(byte_ids)
+        context_latents = self.online_encoder(context_ids)
+        if self.online_state_projector is not None:
+            context_latents = self.online_state_projector(context_latents)
+        if self.predictor_encoder is None:
+            predictor_inputs = context_latents
+        else:
+            predictor_token_inputs = self.predictor_encoder(context_ids)
+            if self.predictor_input == "tokens":
+                predictor_inputs = predictor_token_inputs
+            elif self.predictor_input == "context_plus_tokens":
+                if self.predictor_fusion is None:
+                    raise RuntimeError("Context-plus-tokens predictor requested without fusion module")
+                fused_inputs = torch.cat([context_latents, predictor_token_inputs], dim=-1)
+                predictor_inputs = context_latents + self.predictor_fusion(fused_inputs)
+            else:
+                raise RuntimeError(f"Unexpected predictor input mode {self.predictor_input!r}")
+        action_latents: Tensor | None = None
+        aux_future_preds: dict[int, Tensor] | None = None
+        pred_parallel: Tensor | None = None
+        pred_magnitude: Tensor | None = None
+        if self.predictor_style == "action_transition":
+            if self.action_head is None or self.transition_head is None:
+                raise RuntimeError("Action-transition predictor requested without action/transition heads")
+            action_latents = self.action_head(context_latents)
+            state_features = predictor_inputs.unsqueeze(2).expand(-1, -1, self.num_target_codebooks, -1).float()
+            action_features = action_latents.unsqueeze(2).expand(-1, -1, self.num_target_codebooks, -1).float()
+            transition_inputs = torch.cat([state_features, action_features], dim=-1)
+            pred_target = self.transition_head(transition_inputs)
+        else:
+            if self.predictor is None:
+                raise RuntimeError("Direct predictor requested without predictor module")
+            predictor_features = self.predictor.forward_features(predictor_inputs)
+            pred_target = self.predictor.forward_head(predictor_features)
+            pred_target = pred_target.view(*predictor_inputs.shape[:-1], self.num_target_codebooks, -1)
+            if self.future_aux_heads:
+                aux_future_preds = {}
+                for step_str, head in self.future_aux_heads.items():
+                    aux_pred = head(predictor_features)
+                    aux_future_preds[int(step_str)] = aux_pred.view(*predictor_inputs.shape[:-1], self.num_target_codebooks, -1)
+            if self.contextual_delta_parallel_head is not None:
+                pred_parallel = self.contextual_delta_parallel_head(predictor_inputs).unsqueeze(-1)
+            if self.contextual_delta_magnitude_head is not None:
+                pred_magnitude = self.contextual_delta_magnitude_head(predictor_inputs).unsqueeze(-1)
+        contextual_targets: Tensor | None = None
+        teacher_states: Tensor | None = None
+        target_parallel: Tensor | None = None
+        target_magnitude: Tensor | None = None
+        if self.target_source in {"contextual_only", "contextual_delta", "rotation_scale_delta", "sphere_delta", "additive_delta"}:
+            contextual_states = self._encode_target_states(byte_ids)
+            teacher_states = contextual_states
+            if self.target_source == "contextual_only":
+                contextual_targets = contextual_states[:, self.target_future_steps :, :].unsqueeze(2)
+                target_latents = contextual_targets
+            elif self.target_source == "contextual_delta":
+                contextual_targets, target_latents, target_parallel, target_magnitude = self._contextual_delta_targets(
+                    contextual_states,
+                    steps=self.target_future_steps,
+                )
+            elif self.target_source == "sphere_delta":
+                contextual_targets, sphere_delta_targets = self._sphere_delta_targets(
+                    contextual_states,
+                    steps=self.target_future_steps,
+                )
+                target_latents = contextual_targets if self.rotation_delta_loss_target == "next_state" else sphere_delta_targets
+            elif self.target_source == "additive_delta":
+                contextual_targets, additive_delta_targets = self._additive_delta_targets(
+                    contextual_states,
+                    steps=self.target_future_steps,
+                )
+                target_latents = contextual_targets if self.rotation_delta_loss_target == "next_state" else additive_delta_targets
+            else:
+                contextual_targets, rotation_delta_targets = self._rotation_scale_delta_targets(
+                    contextual_states,
+                    steps=self.target_future_steps,
+                )
+                target_latents = contextual_targets if self.rotation_delta_loss_target == "next_state" else rotation_delta_targets
+        else:
+            anchor_targets = self._anchor_targets(target_ids)
+            target_latents = anchor_targets
+            if self.target_encoder is not None or self.target_encoder_mode == "shared":
+                contextual_states = self._encode_target_states(byte_ids)
+                contextual_targets = contextual_states[:, 1:, :].unsqueeze(2)
+                if self.contextual_target:
+                    if self.contextual_residual_scale > 0.0:
+                        target_latents = self._contextual_residual_targets(anchor_targets, contextual_targets)
+                    else:
+                        target_latents = (
+                            self.target_anchor_weight * anchor_targets
+                            + (1.0 - self.target_anchor_weight) * contextual_targets
+                        )
+        return (
+            target_ids,
+            context_latents,
+            pred_target,
+            aux_future_preds,
+            pred_parallel,
+            pred_magnitude,
+            action_latents,
+            target_latents,
+            contextual_targets,
+            teacher_states,
+            target_parallel,
+            target_magnitude,
+        )
+
+    def _per_position_loss(self, pred_target: Tensor, target_latents: Tensor) -> Tensor:
+        pred_float = pred_target.float()
+        target_float = target_latents.float()
+        if self.jepa_loss == "cosine":
+            pred_norm = F.normalize(pred_float, dim=-1, eps=1e-8)
+            target_norm = F.normalize(target_float, dim=-1, eps=1e-8)
+            per_book = 2.0 - 2.0 * (pred_norm * target_norm).sum(dim=-1)
+            return per_book.mean(dim=-1)
+        if self.jepa_loss == "mse":
+            loss = F.mse_loss(pred_float, target_float, reduction="none").mean(dim=-1)
+            return loss.mean(dim=-1)
+        raise ValueError(f"Unknown JEPA_LOSS={self.jepa_loss!r}")
+
+    def _representation_regularizer(self, pred_target: Tensor, payload_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if self.var_reg_weight <= 0 and self.cov_reg_weight <= 0:
+            zero = pred_target.new_zeros(())
+            return zero, zero, zero
+        flat = pred_target.float()[payload_mask].reshape(-1, pred_target.size(-1))
+        if flat.size(0) <= 1:
+            zero = pred_target.new_zeros(())
+            return zero, zero, zero
+        centered = flat - flat.mean(dim=0, keepdim=True)
+        std = torch.sqrt(centered.var(dim=0, unbiased=False) + 1e-4)
+        var_loss = F.relu(1.0 - std).mean()
+        cov = centered.T @ centered / max(flat.size(0) - 1, 1)
+        cov_loss = _off_diagonal_mean_square(cov)
+        reg = self.var_reg_weight * var_loss + self.cov_reg_weight * cov_loss
+        return reg, var_loss.detach(), cov_loss.detach()
+
+    def _target_representation_regularizer(self, target_latents: Tensor, payload_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if self.target_var_reg_weight <= 0 and self.target_cov_reg_weight <= 0:
+            zero = target_latents.new_zeros(())
+            return zero, zero, zero
+        flat = target_latents.float()[payload_mask].reshape(-1, target_latents.size(-1))
+        if flat.size(0) <= 1:
+            zero = target_latents.new_zeros(())
+            return zero, zero, zero
+        centered = flat - flat.mean(dim=0, keepdim=True)
+        std = torch.sqrt(centered.var(dim=0, unbiased=False) + 1e-4)
+        var_loss = F.relu(1.0 - std).mean()
+        cov = centered.T @ centered / max(flat.size(0) - 1, 1)
+        cov_loss = _off_diagonal_mean_square(cov)
+        reg = self.target_var_reg_weight * var_loss + self.target_cov_reg_weight * cov_loss
+        return reg, var_loss.detach(), cov_loss.detach()
+
+    @torch.no_grad()
+    def _update_eval_codebooks(self, target_ids: Tensor, target_latents: Tensor, payload_mask: Tensor) -> None:
+        if not self.uses_anchor_codebook or not self.contextual_target or self.contextual_residual_scale > 0.0:
+            return
+        flat_targets = target_ids[payload_mask]
+        if flat_targets.numel() == 0:
+            return
+        masked_latents = target_latents.float()[payload_mask]
+        decay = self.prototype_ema_decay
+        for codebook_idx in range(self.num_target_codebooks):
+            sums = torch.zeros_like(self.eval_codebooks[codebook_idx])
+            counts = torch.zeros((self.vocab_size,), device=flat_targets.device, dtype=torch.float32)
+            sums.index_add_(0, flat_targets, masked_latents[:, codebook_idx, :])
+            counts.index_add_(0, flat_targets, torch.ones_like(flat_targets, dtype=torch.float32))
+            valid = counts > 0
+            if not valid.any():
+                continue
+            means = sums[valid] / counts[valid].unsqueeze(1)
+            self.eval_codebooks[codebook_idx, valid].mul_(decay).add_(means, alpha=1.0 - decay)
+
+    def _lm_probe_features(
+        self,
+        pred_target: Tensor,
+        pred_parallel: Tensor | None,
+        pred_magnitude: Tensor | None,
+        context_latents: Tensor,
+        action_latents: Tensor | None,
+    ) -> Tensor:
+        scaled_pred: Tensor | None = None
+        if pred_magnitude is not None:
+            scaled_pred = _scaled_contextual_delta(pred_target, context_latents.unsqueeze(2), pred_magnitude)
+        if self.lm_probe_input == "pred_target":
+            features = pred_target.float()
+            return features.reshape(-1, self.num_target_codebooks * features.size(-1))
+        if self.lm_probe_input == "pred_residual":
+            features = _orthogonal_residual(pred_target, context_latents.unsqueeze(2))
+            return features.reshape(-1, self.num_target_codebooks * features.size(-1))
+        if self.lm_probe_input == "context_plus_pred":
+            context_features = context_latents.unsqueeze(2).expand(-1, -1, self.num_target_codebooks, -1).float()
+            features = torch.cat([context_features, pred_target.float()], dim=-1)
+            return features.reshape(-1, self.num_target_codebooks * features.size(-1))
+        if self.lm_probe_input == "context_plus_scaled_pred":
+            if scaled_pred is None:
+                raise RuntimeError("LM_PROBE_INPUT='context_plus_scaled_pred' requires contextual delta magnitude predictions")
+            context_features = context_latents.unsqueeze(2).expand(-1, -1, self.num_target_codebooks, -1).float()
+            features = torch.cat([context_features, scaled_pred.float()], dim=-1)
+            return features.reshape(-1, self.num_target_codebooks * features.size(-1))
+        if self.lm_probe_input == "context_plus_pred_parallel":
+            if pred_parallel is None:
+                raise RuntimeError("LM_PROBE_INPUT='context_plus_pred_parallel' requires contextual delta parallel predictions")
+            context_features = context_latents.unsqueeze(2).expand(-1, -1, self.num_target_codebooks, -1).float()
+            features = torch.cat([context_features, pred_target.float(), pred_parallel.float()], dim=-1)
+            return features.reshape(-1, self.num_target_codebooks * features.size(-1))
+        if self.lm_probe_input == "context_plus_pred_magnitude":
+            if scaled_pred is None or pred_magnitude is None:
+                raise RuntimeError("LM_PROBE_INPUT='context_plus_pred_magnitude' requires contextual delta magnitude predictions")
+            context_features = context_latents.unsqueeze(2).expand(-1, -1, self.num_target_codebooks, -1).float()
+            features = torch.cat([context_features, scaled_pred.float(), pred_magnitude.float()], dim=-1)
+            return features.reshape(-1, self.num_target_codebooks * features.size(-1))
+        if action_latents is None:
+            raise RuntimeError(f"LM_PROBE_INPUT={self.lm_probe_input!r} requires action latents")
+        if self.lm_probe_input == "action":
+            return action_latents.float().reshape(-1, action_latents.size(-1))
+        features = torch.cat([context_latents.float(), action_latents.float()], dim=-1)
+        return features.reshape(-1, features.size(-1))
+
+    def _lm_probe_logits(
+        self,
+        pred_target: Tensor,
+        pred_parallel: Tensor | None,
+        pred_magnitude: Tensor | None,
+        context_latents: Tensor,
+        action_latents: Tensor | None,
+        *,
+        detach_input: bool,
+    ) -> Tensor:
+        if self.lm_head is None:
+            raise RuntimeError("LM probe requested without lm_head")
+        flat_pred = self._lm_probe_features(pred_target, pred_parallel, pred_magnitude, context_latents, action_latents)
+        if detach_input:
+            flat_pred = flat_pred.detach()
+        return self.lm_head(flat_pred)
+
+    def _lm_probe_nll_sum(
+        self,
+        pred_target: Tensor,
+        pred_parallel: Tensor | None,
+        pred_magnitude: Tensor | None,
+        context_latents: Tensor,
+        action_latents: Tensor | None,
+        target_ids: Tensor,
+        payload_mask: Tensor,
+        *,
+        detach_input: bool,
+    ) -> Tensor:
+        if self.lm_head is None:
+            return pred_target.new_zeros(())
+        logits = self._lm_probe_logits(
+            pred_target,
+            pred_parallel,
+            pred_magnitude,
+            context_latents,
+            action_latents,
+            detach_input=detach_input,
+        )
+        flat_targets = target_ids.reshape(-1)
+        nll = F.cross_entropy(logits, flat_targets, reduction="none")
+        return nll[payload_mask.reshape(-1)].sum()
+
+    def _validation_logits(self, pred_target: Tensor) -> Tensor:
+        if not self.uses_anchor_codebook:
+            raise RuntimeError("Validation logits without an LM head require a codebook-backed target source")
+        flat_pred = pred_target.float().reshape(-1, self.num_target_codebooks, pred_target.size(-1))
+        codebooks = self.eval_codebooks.detach().float()
+        logits = torch.zeros((flat_pred.size(0), self.vocab_size), device=flat_pred.device, dtype=torch.float32)
+
+        if self.eval_bridge == "cosine":
+            pred_repr = F.normalize(flat_pred, dim=-1, eps=1e-8)
+            codebook_repr = F.normalize(codebooks, dim=-1, eps=1e-8)
+            for codebook_idx in range(self.num_target_codebooks):
+                logits += pred_repr[:, codebook_idx, :] @ codebook_repr[codebook_idx].T
+            return self.eval_logit_scale * logits
+
+        if self.eval_bridge == "dot":
+            for codebook_idx in range(self.num_target_codebooks):
+                logits += flat_pred[:, codebook_idx, :] @ codebooks[codebook_idx].T
+            return self.eval_logit_scale * logits
+
+        if self.eval_bridge == "neg_l2":
+            for codebook_idx in range(self.num_target_codebooks):
+                pred_book = flat_pred[:, codebook_idx, :]
+                codebook = codebooks[codebook_idx]
+                pred_sq = (pred_book * pred_book).sum(dim=-1, keepdim=True)
+                code_sq = (codebook * codebook).sum(dim=-1).unsqueeze(0)
+                logits += -(pred_sq + code_sq - 2.0 * (pred_book @ codebook.T))
+            return self.eval_logit_scale * logits
+
+        if self.eval_bridge in {"mse", "neg_mse"}:
+            for codebook_idx in range(self.num_target_codebooks):
+                pred_book = flat_pred[:, codebook_idx, :]
+                codebook = codebooks[codebook_idx]
+                pred_sq = (pred_book * pred_book).sum(dim=-1, keepdim=True)
+                code_sq = (codebook * codebook).sum(dim=-1).unsqueeze(0)
+                sq_dist = pred_sq + code_sq - 2.0 * (pred_book @ codebook.T)
+                logits += -(sq_dist / pred_book.size(-1))
+            logits /= self.num_target_codebooks
+            return self.eval_logit_scale * logits
+
+        raise ValueError(f"Unknown EVAL_BRIDGE={self.eval_bridge!r}")
+
+    def _compute_latent_metrics(
+        self, byte_ids: Tensor
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor | None,
+        Tensor | None,
+        Tensor | None,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+    ]:
+        (
+            target_ids,
+            context_latents,
+            pred_target,
+            aux_future_preds,
+            pred_parallel,
+            pred_magnitude,
+            action_latents,
+            target_latents,
+            contextual_targets,
+            teacher_states,
+            target_parallel,
+            target_magnitude,
+        ) = self._predict_target_latents(byte_ids)
+        effective_len = target_latents.size(1)
+        target_ids = target_ids[:, :effective_len]
+        context_latents = context_latents[:, :effective_len]
+        pred_target = pred_target[:, :effective_len]
+        if pred_parallel is not None:
+            pred_parallel = pred_parallel[:, :effective_len]
+        if pred_magnitude is not None:
+            pred_magnitude = pred_magnitude[:, :effective_len]
+        if action_latents is not None:
+            action_latents = action_latents[:, :effective_len]
+        if contextual_targets is not None:
+            contextual_targets = contextual_targets[:, :effective_len]
+        if target_parallel is not None:
+            target_parallel = target_parallel[:, :effective_len]
+        if target_magnitude is not None:
+            target_magnitude = target_magnitude[:, :effective_len]
+        payload_mask = self._payload_mask(target_ids)
+        num_bytes = payload_mask.to(dtype=torch.float32).sum()
+        if int(num_bytes.item()) <= 0:
+            raise ValueError("Batch contains no payload-byte targets")
+        loss_pred = pred_target
+        if self.target_source == "rotation_scale_delta" and self.rotation_delta_loss_target == "next_state":
+            loss_pred = _reconstruct_rotation_scale_next_state(context_latents.unsqueeze(2), pred_target).to(dtype=pred_target.dtype)
+        if self.target_source == "sphere_delta" and self.rotation_delta_loss_target == "next_state":
+            loss_pred = _reconstruct_sphere_delta_next_state(context_latents.unsqueeze(2), pred_target).to(dtype=pred_target.dtype)
+        if self.target_source == "additive_delta" and self.rotation_delta_loss_target == "next_state":
+            loss_pred = _reconstruct_additive_delta_next_state(
+                context_latents.unsqueeze(2),
+                pred_target,
+                normalize_anchor=self.additive_delta_normalization in {"states", "states_and_diff"},
+                normalize_output=self.additive_delta_normalization in {"states", "states_and_diff"},
+            ).to(dtype=pred_target.dtype)
+        if self.target_source == "contextual_delta" and self.contextual_delta_magnitude_weight > 0.0:
+            loss_pred = _orthogonal_residual(pred_target, context_latents.unsqueeze(2)).to(dtype=pred_target.dtype)
+        per_pos_loss = self._per_position_loss(loss_pred, target_latents)
+        loss_sum = per_pos_loss[payload_mask].sum()
+        future_aux_loss = pred_target.new_zeros(())
+        if self.aux_target_weight > 0.0 and aux_future_preds:
+            if teacher_states is None:
+                raise RuntimeError("Auxiliary future targets requested without teacher states")
+            aux_terms: list[Tensor] = []
+            for step, aux_pred in aux_future_preds.items():
+                if self.target_source != "contextual_delta":
+                    continue
+                _, aux_targets, _, _ = self._contextual_delta_targets(teacher_states, steps=step)
+                aux_len = aux_targets.size(1)
+                if aux_len <= 0:
+                    continue
+                aux_pred = aux_pred[:, :aux_len]
+                aux_target_ids = target_ids[:, step - 1 : step - 1 + aux_len]
+                aux_payload_mask = self._payload_mask(aux_target_ids)
+                if int(aux_payload_mask.to(dtype=torch.int32).sum().item()) == 0:
+                    continue
+                aux_per_pos_loss = self._per_position_loss(aux_pred, aux_targets)
+                aux_terms.append(aux_per_pos_loss[aux_payload_mask].mean())
+            if aux_terms:
+                future_aux_loss = torch.stack(aux_terms).mean()
+        sparse_delta_loss = pred_target.new_zeros(())
+        if self.contextual_delta_l1_weight > 0.0:
+            masked_pred = pred_target.float()[payload_mask]
+            if masked_pred.numel() > 0:
+                sparse_delta_loss = masked_pred.abs().mean()
+        parallel_loss_sum = pred_target.new_zeros(())
+        if self.contextual_delta_parallel_weight > 0.0:
+            if pred_parallel is None or target_parallel is None:
+                raise RuntimeError("Contextual delta parallel loss requested without scalar predictions/targets")
+            parallel_loss = F.mse_loss(pred_parallel.float(), target_parallel.float(), reduction="none").mean(dim=-1).mean(dim=-1)
+            parallel_loss_sum = parallel_loss[payload_mask].sum()
+        magnitude_loss_sum = pred_target.new_zeros(())
+        if self.contextual_delta_magnitude_weight > 0.0:
+            if pred_magnitude is None or target_magnitude is None:
+                raise RuntimeError("Contextual delta magnitude loss requested without scalar predictions/targets")
+            magnitude_loss = F.mse_loss(pred_magnitude.float(), target_magnitude.float(), reduction="none").mean(dim=-1).mean(dim=-1)
+            magnitude_loss_sum = magnitude_loss[payload_mask].sum()
+        teacher_orth_loss_sum = pred_target.new_zeros(())
+        if self.contextual_delta_teacher_orth_weight > 0.0:
+            if teacher_states is None:
+                raise RuntimeError("Teacher-orth loss requested without teacher states")
+            teacher_anchor = teacher_states[:, :effective_len, :].unsqueeze(2)
+            teacher_anchor_norm = F.normalize(teacher_anchor.float(), dim=-1, eps=1e-8)
+            parallel_component = (pred_target.float() * teacher_anchor_norm).sum(dim=-1)
+            teacher_orth_loss = parallel_component.square().mean(dim=-1)
+            teacher_orth_loss_sum = teacher_orth_loss[payload_mask].sum()
+        aux_loss_sum = pred_target.new_zeros(())
+        if self.contextual_aux_weight > 0.0:
+            if self.contextual_predictor is None or contextual_targets is None:
+                raise RuntimeError("Contextual auxiliary loss requires a target encoder and contextual predictor")
+            aux_pred = self.contextual_predictor(context_latents).unsqueeze(2)
+            aux_per_pos_loss = self._per_position_loss(aux_pred, contextual_targets)
+            aux_loss_sum = aux_per_pos_loss[payload_mask].sum()
+        return (
+            target_ids,
+            payload_mask,
+            num_bytes,
+            context_latents.float(),
+            pred_target.float(),
+            pred_parallel.float() if pred_parallel is not None else None,
+            pred_magnitude.float() if pred_magnitude is not None else None,
+            action_latents.float() if action_latents is not None else None,
+            target_latents.float(),
+            teacher_states.float() if teacher_states is not None else None,
+            loss_sum,
+            future_aux_loss.float(),
+            sparse_delta_loss.float(),
+            parallel_loss_sum.float(),
+            magnitude_loss_sum.float(),
+            teacher_orth_loss_sum.float(),
+            aux_loss_sum.float(),
+        )
+
+    def training_step(self, byte_ids: Tensor) -> dict[str, Tensor]:
+        target_ids, payload_mask, num_bytes, context_latents, pred_target, pred_parallel, pred_magnitude, action_latents, target_latents, teacher_states, loss_sum, future_aux_loss, sparse_delta_loss, parallel_loss_sum, magnitude_loss_sum, teacher_orth_loss_sum, aux_loss_sum = (
+            self._compute_latent_metrics(byte_ids)
+        )
+        base_loss = loss_sum / num_bytes
+        parallel_loss = parallel_loss_sum / num_bytes
+        magnitude_loss = magnitude_loss_sum / num_bytes
+        teacher_orth_loss = teacher_orth_loss_sum / num_bytes
+        aux_loss = aux_loss_sum / num_bytes
+        reg_loss, var_loss, cov_loss = self._representation_regularizer(pred_target, payload_mask)
+        target_reg_loss, target_var_loss, target_cov_loss = self._target_representation_regularizer(
+            target_latents, payload_mask
+        )
+        contrastive_loss = self._contrastive_infonce_loss(pred_target, pred_parallel, pred_magnitude, context_latents, teacher_states, payload_mask)
+        lm_probe_loss = self._lm_probe_nll_sum(
+            pred_target,
+            pred_parallel,
+            pred_magnitude,
+            context_latents,
+            action_latents,
+            target_ids,
+            payload_mask,
+            detach_input=True,
+        ) / num_bytes
+        loss = (
+            base_loss
+            + self.aux_target_weight * future_aux_loss
+            + self.contextual_delta_l1_weight * sparse_delta_loss
+            + self.contextual_delta_parallel_weight * parallel_loss
+            + self.contextual_delta_magnitude_weight * magnitude_loss
+            + self.contextual_delta_teacher_orth_weight * teacher_orth_loss
+            + self.contextual_aux_weight * aux_loss
+            + reg_loss
+            + target_reg_loss
+            + self.contrastive_weight * contrastive_loss
+            + self.lm_probe_weight * lm_probe_loss
+        )
+        self._update_eval_codebooks(target_ids, target_latents, payload_mask)
+        return {
+            "loss": loss,
+            "loss_sum": loss_sum.detach(),
+            "num_bytes": num_bytes.detach(),
+            "future_aux_loss": future_aux_loss.detach(),
+            "sparse_delta_loss": sparse_delta_loss.detach(),
+            "parallel_loss": parallel_loss.detach(),
+            "magnitude_loss": magnitude_loss.detach(),
+            "teacher_orth_loss": teacher_orth_loss.detach(),
+            "contextual_aux_loss": aux_loss.detach(),
+            "lm_probe_loss": lm_probe_loss.detach(),
+            "contrastive_loss": contrastive_loss.detach(),
+            "repr_reg_loss": reg_loss.detach(),
+            "var_loss": var_loss,
+            "cov_loss": cov_loss,
+            "target_repr_reg_loss": target_reg_loss.detach(),
+            "target_var_loss": target_var_loss,
+            "target_cov_loss": target_cov_loss,
+        }
+
+    def validation_step(self, byte_ids: Tensor) -> dict[str, Tensor]:
+        target_ids, payload_mask, num_bytes, context_latents, pred_target, pred_parallel, pred_magnitude, action_latents, _, _, loss_sum, _, _, _, _, _, _ = self._compute_latent_metrics(byte_ids)
+        if self.lm_head is not None:
+            nll_sum_nat = self._lm_probe_nll_sum(
+                pred_target,
+                pred_parallel,
+                pred_magnitude,
+                context_latents,
+                action_latents,
+                target_ids,
+                payload_mask,
+                detach_input=False,
+            )
+        else:
+            logits = self._validation_logits(pred_target)
+            flat_targets = target_ids.reshape(-1)
+            nll = F.cross_entropy(logits, flat_targets, reduction="none")
+            nll_sum_nat = nll[payload_mask.reshape(-1)].sum()
+        return {
+            "loss_sum": loss_sum.detach(),
+            "num_bytes": num_bytes.detach(),
+            "nll_sum_nat": nll_sum_nat.detach(),
+        }
+
+    @torch.no_grad()
+    def update_target_encoder(self) -> None:
+        decay = self.target_ema_decay
+        if self.target_encoder is not None and self.target_encoder_mode == "ema":
+            for tgt, src in zip(self.target_encoder.parameters(), self.online_encoder.parameters(), strict=True):
+                tgt.data.mul_(decay).add_(src.data, alpha=1.0 - decay)
+        if self.target_state_projector is not None and self.online_state_projector is not None and self.target_encoder_mode == "ema":
+            for tgt, src in zip(self.target_state_projector.parameters(), self.online_state_projector.parameters(), strict=True):
+                tgt.data.mul_(decay).add_(src.data, alpha=1.0 - decay)
+        if self.uses_anchor_codebook and self.target_codebook == "ema":
+            self.target_codebooks[0].data.mul_(decay).add_(self.online_encoder.tok_emb.weight.data, alpha=1.0 - decay)
+            if not self.contextual_target or self.contextual_residual_scale > 0.0:
+                self.eval_codebooks[0].data.copy_(self.target_codebooks[0].data)
+
+    def export_state_dict(self) -> dict[str, Tensor]:
+        return self.state_dict()
+
+
+def configure_optimizers(model: PureByteJEPA, args: Any) -> list[torch.optim.Optimizer]:
+    optimizer_kind = getattr(args, "optimizer", "adamw").lower()
+    named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+
+    split_head = getattr(args, "split_lm_probe_optimizer", False) and model.lm_head is not None
+    head_named_params = [(name, param) for name, param in named_params if split_head and name.startswith("lm_head.")]
+    head_param_ids = {id(param) for _, param in head_named_params}
+    main_named_params = [(name, param) for name, param in named_params if id(param) not in head_param_ids]
+
+    if optimizer_kind == "muon":
+        embed_params = [param for name, param in main_named_params if name.endswith("tok_emb.weight")]
+        embed_param_ids = {id(param) for param in embed_params}
+        control_param_ids = {
+            id(param)
+            for name, param in main_named_params
+            if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        }
+        matrix_params = [
+            param
+            for name, param in main_named_params
+            if param.ndim == 2 and id(param) not in embed_param_ids and id(param) not in control_param_ids
+        ]
+        matrix_param_ids = {id(param) for param in matrix_params}
+        scalar_params = [
+            param
+            for _, param in main_named_params
+            if id(param) not in embed_param_ids and id(param) not in matrix_param_ids
+        ]
+
+        optimizers: list[torch.optim.Optimizer] = []
+        if embed_params:
+            optimizer_embed = torch.optim.AdamW(
+                [{"params": embed_params, "lr": args.embed_lr, "base_lr": args.embed_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                weight_decay=args.weight_decay,
+            )
+            optimizers.append(optimizer_embed)
+        if matrix_params:
+            optimizer_muon = Muon(
+                matrix_params,
+                lr=args.matrix_lr,
+                momentum=args.muon_momentum,
+                backend_steps=args.muon_backend_steps,
+            )
+            for group in optimizer_muon.param_groups:
+                group["base_lr"] = args.matrix_lr
+            optimizers.append(optimizer_muon)
+        if scalar_params:
+            optimizer_scalar = torch.optim.AdamW(
+                [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                weight_decay=args.weight_decay,
+            )
+            optimizers.append(optimizer_scalar)
+        if head_named_params:
+            optimizer_head = torch.optim.AdamW(
+                [{"params": [param for _, param in head_named_params], "lr": args.lm_probe_lr, "base_lr": args.lm_probe_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                weight_decay=args.weight_decay,
+            )
+            optimizers.append(optimizer_head)
+        return optimizers
+
+    if split_head:
+        lm_head_params = [param for _, param in head_named_params]
+        main_params = [param for _, param in main_named_params]
+        main_optimizer = torch.optim.AdamW(
+            main_params,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+        )
+        probe_optimizer = torch.optim.AdamW(
+            lm_head_params,
+            lr=args.lm_probe_lr,
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+        )
+        return [main_optimizer, probe_optimizer]
+
+    optimizer = torch.optim.AdamW(
+        [param for _, param in named_params],
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay,
+    )
+    return [optimizer]
+
+====================================================================================================
+Running Python 3.13.5 | packaged by Anaconda, Inc. | (main, Jun 12 2025, 16:09:02) [GCC 11.2.0]
+Running PyTorch 2.11.0+cu128
+Sat Apr  4 01:49:20 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.09             Driver Version: 580.126.09     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 5090        Off |   00000000:02:00.0 Off |                  N/A |
+|100%   89C    P1            420W /  600W |   29767MiB /  32607MiB |     98%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 5090        Off |   00000000:86:00.0 Off |                  N/A |
+| 74%   68C    P1             87W /  600W |   25399MiB /  32607MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            2094      G   /usr/lib/xorg/Xorg                        4MiB |
+|    0   N/A  N/A          328069      C   .venv/bin/python                      29744MiB |
+|    1   N/A  N/A            2094      G   /usr/lib/xorg/Xorg                        4MiB |
+|    1   N/A  N/A           34014      C   ...s/contrastive-like/bin/python      24872MiB |
+|    1   N/A  N/A          331912      C   .venv/bin/python                        498MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+dataset_kind:pure_byte tokenizer_path:/home/clp/parameter-golf/data/tokenizers/fineweb_pure_byte_260.json
+train_loader:dataset:fineweb10B_byte260 train_shards:1
+val_loader:shards pattern=/home/clp/parameter-golf/data/datasets/fineweb10B_byte260/fineweb_val_*.bin bytes:16777216 full_bytes:151130624 subset_only:1
+model_params:8691204
+world_size:1 grad_accum_steps:1
+train_batch_bytes:65536 train_seq_len:128 iterations:5000 warmup_steps:0 max_wallclock_seconds:600.000
+optimizer:muon embed_lr:0.03 matrix_lr:0.02 scalar_lr:0.02 lm_probe_lr:0.0003
+seed:1337
+step:1/5000 train_loss:3.992638 train_time:588ms step_avg:587.90ms
+step:2/5000 train_loss:4.236907 train_time:722ms step_avg:361.07ms
+step:3/5000 train_loss:4.179729 train_time:846ms step_avg:281.95ms
+step:4/5000 train_loss:4.100521 train_time:977ms step_avg:244.33ms
+step:5/5000 train_loss:3.989624 train_time:1113ms step_avg:222.58ms
+step:6/5000 train_loss:3.837289 train_time:1249ms step_avg:208.16ms
+step:7/5000 train_loss:3.724817 train_time:1384ms step_avg:197.76ms
+step:8/5000 train_loss:3.688811 train_time:1524ms step_avg:190.54ms
+step:9/5000 train_loss:3.626773 train_time:1665ms step_avg:184.96ms
+step:10/5000 train_loss:3.580167 train_time:1796ms step_avg:179.61ms
+step:400/5000 train_loss:1.881442 train_time:49944ms step_avg:124.86ms
+step:800/5000 train_loss:1.690714 train_time:97490ms step_avg:121.86ms
+step:1200/5000 train_loss:1.638003 train_time:142170ms step_avg:118.48ms
+step:1600/5000 train_loss:1.573625 train_time:187077ms step_avg:116.92ms
+step:2000/5000 train_loss:1.635240 train_time:231940ms step_avg:115.97ms
+step:2400/5000 train_loss:1.523252 train_time:276664ms step_avg:115.28ms
+step:2800/5000 train_loss:1.511778 train_time:321395ms step_avg:114.78ms
+step:3200/5000 train_loss:1.478010 train_time:369435ms step_avg:115.45ms
+step:3600/5000 train_loss:1.459238 train_time:418508ms step_avg:116.25ms
+step:4000/5000 train_loss:1.546530 train_time:463525ms step_avg:115.88ms
+step:4400/5000 train_loss:1.531594 train_time:508293ms step_avg:115.52ms
+step:4800/5000 train_loss:1.582554 train_time:553245ms step_avg:115.26ms
+step:5000/5000 val_proxy_loss:0.249601 val_bpb_subset:2.575699 val_bpb:NA proxy_only:1 train_time:578890ms step_avg:115.78ms
+peak memory allocated: 4669 MiB reserved: 4746 MiB
+Serialized model: 34813083 bytes
+Code size: 121926 bytes
+Total submission size: 34935009 bytes
+Serialized model int8+zlib: 8464273 bytes (payload:9425448 raw_torch:9479285 payload_ratio:3.69x)
+Total submission size int8+zlib: 8586199 bytes
+final_int8_zlib_roundtrip val_proxy_loss:0.249431 val_bpb_subset:2.580606 val_bpb:NA proxy_only:1 eval_time:12175ms

@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 64682,
+  "artifact_model_bytes_int8_zlib": 5558358,
+  "artifact_total_bytes_int8_zlib": 5623040,
+  "proxy_only": true,
+  "proxy_val_loss": 0.6096858333542223,
+  "run_id": "smoke_hadamard_causaltgt_predhid512_cosine_lmprobe1_muon_tuned_10min_g0",
+  "subset_val_bpb": 1.987383082711249,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130112
+}

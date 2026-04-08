@@ -1,0 +1,9 @@
+/home/clp/parameter-golf/.venv/lib/python3.13/site-packages/torch/cuda/__init__.py:180: UserWarning: CUDA initialization: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 304: OS call failed or operation not supported on this OS (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:119.)
+  return torch._C._cuda_getDeviceCount() > 0
+Traceback (most recent call last):
+  File "/home/clp/parameter-golf/records/track_non_record_16mb/2026-03-25_PureJEPA_Byte/runs/pilot_rawctxdelta_ctxlatent_predstack1_predhid1536_dim256_projlinear_nocontrast_5min_g1/launcher.py", line 4, in <module>
+    train_jepa.main()
+    ~~~~~~~~~~~~~~~^^
+  File "/home/clp/parameter-golf/records/track_non_record_16mb/2026-03-25_PureJEPA_Byte/train_jepa.py", line 508, in main
+    raise RuntimeError("CUDA is required for this training scaffold")
+RuntimeError: CUDA is required for this training scaffold

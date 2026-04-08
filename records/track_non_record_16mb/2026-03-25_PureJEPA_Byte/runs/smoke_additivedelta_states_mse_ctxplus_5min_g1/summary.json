@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 90791,
+  "artifact_model_bytes_int8_zlib": 2691495,
+  "artifact_total_bytes_int8_zlib": 2782286,
+  "proxy_only": true,
+  "proxy_val_loss": 0.25129372398674504,
+  "run_id": "smoke_additivedelta_states_mse_ctxplus_5min_g1",
+  "subset_val_bpb": 3.0204099264776803,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

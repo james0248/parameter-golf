@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 101999,
+  "artifact_model_bytes_int8_zlib": 2790044,
+  "artifact_total_bytes_int8_zlib": 2892043,
+  "proxy_only": true,
+  "proxy_val_loss": 0.39536438589901296,
+  "run_id": "smoke_ctxdelta_dirlog_magprobe_5min_g1",
+  "subset_val_bpb": 2.5808090039913845,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

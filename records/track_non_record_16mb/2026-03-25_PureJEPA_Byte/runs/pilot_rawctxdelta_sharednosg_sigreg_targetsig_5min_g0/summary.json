@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 107827,
+  "artifact_model_bytes_int8_zlib": 2407579,
+  "artifact_total_bytes_int8_zlib": 2515406,
+  "proxy_only": true,
+  "proxy_val_loss": 0.005616009877088497,
+  "run_id": "pilot_rawctxdelta_sharednosg_sigreg_targetsig_5min_g0",
+  "subset_val_bpb": 4.68042738557919,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

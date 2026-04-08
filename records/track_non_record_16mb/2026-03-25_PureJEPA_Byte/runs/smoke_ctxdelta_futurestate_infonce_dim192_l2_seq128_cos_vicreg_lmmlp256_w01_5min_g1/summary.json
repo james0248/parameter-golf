@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 75323,
+  "artifact_model_bytes_int8_zlib": 2810767,
+  "artifact_total_bytes_int8_zlib": 2886090,
+  "proxy_only": true,
+  "proxy_val_loss": 0.47812203801570924,
+  "run_id": "smoke_ctxdelta_futurestate_infonce_dim192_l2_seq128_cos_vicreg_lmmlp256_w01_5min_g1",
+  "subset_val_bpb": 2.4696090459720406,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

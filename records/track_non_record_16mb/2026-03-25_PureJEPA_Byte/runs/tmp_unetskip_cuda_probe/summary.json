@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 121926,
+  "artifact_model_bytes_int8_zlib": 510905,
+  "artifact_total_bytes_int8_zlib": 632831,
+  "proxy_only": true,
+  "proxy_val_loss": 0.04199558621920072,
+  "run_id": "tmp_unetskip_cuda_probe",
+  "subset_val_bpb": 7.7678097924040035,
+  "val_bpb": null,
+  "validation_bytes": 1048576,
+  "validation_full_bytes": 151130624
+}

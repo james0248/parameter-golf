@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 80474,
+  "artifact_model_bytes_int8_zlib": 3061241,
+  "artifact_total_bytes_int8_zlib": 3141715,
+  "proxy_only": true,
+  "proxy_val_loss": 0.5561740409885448,
+  "run_id": "smoke_ema_static_pred_lmmlp256_seq256_cosine_lmprobe05_5min_g1",
+  "subset_val_bpb": 1.9542625677942553,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 91336,
+  "artifact_model_bytes_int8_zlib": 2815696,
+  "artifact_total_bytes_int8_zlib": 2907032,
+  "proxy_only": true,
+  "proxy_val_loss": 0.6263220280964187,
+  "run_id": "smoke_rawctxdelta_mse_fsnce005_5min_g1",
+  "subset_val_bpb": 2.3997912109505948,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

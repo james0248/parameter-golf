@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 108431,
+  "artifact_model_bytes_int8_zlib": 3872519,
+  "artifact_total_bytes_int8_zlib": 3980950,
+  "proxy_only": true,
+  "proxy_val_loss": 0.09458563938344827,
+  "run_id": "pilot_rawctxdelta_ctxlatent_predstack1_predhid1536_dim256_nocontrast_h4_anchor_5min_g0",
+  "subset_val_bpb": 3.5289681576947345,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

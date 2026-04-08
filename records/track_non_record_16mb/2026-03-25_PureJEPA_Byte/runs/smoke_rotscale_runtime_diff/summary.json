@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 84816,
+  "artifact_model_bytes_int8_zlib": 2495929,
+  "artifact_total_bytes_int8_zlib": 2580745,
+  "proxy_only": true,
+  "proxy_val_loss": 1.883873046875,
+  "run_id": "smoke_rotscale_runtime_diff",
+  "subset_val_bpb": 8.039500220654453,
+  "val_bpb": null,
+  "validation_bytes": 1048576,
+  "validation_full_bytes": 151130624
+}

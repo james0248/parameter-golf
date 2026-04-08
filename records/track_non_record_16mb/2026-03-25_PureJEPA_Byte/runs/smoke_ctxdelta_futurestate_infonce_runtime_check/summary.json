@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 75323,
+  "artifact_model_bytes_int8_zlib": 2460147,
+  "artifact_total_bytes_int8_zlib": 2535470,
+  "proxy_only": true,
+  "proxy_val_loss": 1.8552240009014422,
+  "run_id": "smoke_ctxdelta_futurestate_infonce_runtime_check",
+  "subset_val_bpb": 8.019391661467196,
+  "val_bpb": null,
+  "validation_bytes": 1048576,
+  "validation_full_bytes": 151130624
+}

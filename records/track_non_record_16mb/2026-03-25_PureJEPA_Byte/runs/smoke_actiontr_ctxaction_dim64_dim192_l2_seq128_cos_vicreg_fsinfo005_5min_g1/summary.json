@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 79618,
+  "artifact_model_bytes_int8_zlib": 3019965,
+  "artifact_total_bytes_int8_zlib": 3099583,
+  "proxy_only": true,
+  "proxy_val_loss": 0.02760748039343865,
+  "run_id": "smoke_actiontr_ctxaction_dim64_dim192_l2_seq128_cos_vicreg_fsinfo005_5min_g1",
+  "subset_val_bpb": 4.140424018840899,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}

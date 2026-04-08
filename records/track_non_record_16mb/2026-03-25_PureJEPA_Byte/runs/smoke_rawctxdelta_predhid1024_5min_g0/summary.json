@@ -1,0 +1,12 @@
+{
+  "artifact_code_bytes": 103106,
+  "artifact_model_bytes_int8_zlib": 2866382,
+  "artifact_total_bytes_int8_zlib": 2969488,
+  "proxy_only": true,
+  "proxy_val_loss": 0.5984281628715208,
+  "run_id": "smoke_rawctxdelta_predhid1024_5min_g0",
+  "subset_val_bpb": 2.402892458866477,
+  "val_bpb": null,
+  "validation_bytes": 16777216,
+  "validation_full_bytes": 151130624
+}
