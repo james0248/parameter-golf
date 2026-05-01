@@ -2,7 +2,7 @@
 """Final-only pure-byte JEPA trainer.
 
 Kept branch: byte260, contextual-delta JEPA, LagMixer, auxiliary LM head,
-single-GPU Muon training, train_gpt-style contiguous validation, mixed int8 export.
+8xH100 DDP Muon training, train_gpt-style contiguous validation, mixed int8 export.
 """
 
 from __future__ import annotations
@@ -22,8 +22,10 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -36,16 +38,17 @@ class Cfg:
     tokenizer_path: str = os.environ.get("TOKENIZER_PATH", str(REPO_ROOT / "data/tokenizers/fineweb_pure_byte_260.json"))
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", "1337"))
-    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", "131072"))
-    val_max_bytes: int = int(os.environ.get("VAL_MAX_BYTES", "16777216"))
-    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", "1108"))
-    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", "554"))
-    iterations: int = int(os.environ.get("ITERATIONS", "4431"))
-    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", "2659"))
-    train_batch_bytes: int = int(os.environ.get("TRAIN_BATCH_BYTES", "327680"))
+    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", "524288"))
+    val_max_bytes: int = int(os.environ.get("VAL_MAX_BYTES", "0"))
+    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", "0"))
+    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", "500"))
+    iterations: int = int(os.environ.get("ITERATIONS", "20000"))
+    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", "1200"))
+    warmdown_frac: float = float(os.environ.get("WARMDOWN_FRAC", "0.85"))
+    train_batch_bytes: int = int(os.environ.get("TRAIN_BATCH_BYTES", "786432"))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", "256"))
-    grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", "2"))
-    max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", "1425"))
+    grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", "0"))
+    max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", "600"))
     vocab_size: int = 260
     bos_token_id: int = 1
     byte_offset: int = 4
@@ -57,20 +60,20 @@ class Cfg:
     predictor_hidden_dim: int = 2048
     predictor_num_layers: int = 1
     lm_probe_hidden_dim: int = 1024
-    target_ema_decay: float = 0.99
+    target_ema_decay: float = float(os.environ.get("TARGET_EMA_DECAY", "0.9965"))
     lm_probe_weight: float = 0.5
     var_reg_weight: float = 1.0
     cov_reg_weight: float = 0.0225
-    min_lr_scale: float = 0.05
-    embed_lr: float = 0.03
-    matrix_lr: float = 0.02
-    scalar_lr: float = 0.02
+    min_lr_scale: float = float(os.environ.get("MIN_LR_SCALE", os.environ.get("MIN_LR", "0.10")))
+    embed_lr: float = float(os.environ.get("EMBED_LR", "0.03"))
+    matrix_lr: float = float(os.environ.get("MATRIX_LR", "0.026"))
+    scalar_lr: float = float(os.environ.get("SCALAR_LR", "0.02"))
     weight_decay: float = 0.01
     beta1: float = 0.9
-    beta2: float = 0.95
+    beta2: float = float(os.environ.get("BETA2", "0.99"))
     adam_eps: float = 1e-8
     grad_clip_norm: float = 0.3
-    muon_momentum: float = 0.99
+    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", "0.97"))
     muon_backend_steps: int = 5
     muon_momentum_warmup_start: float = 0.92
     muon_momentum_warmup_steps: int = 1500
@@ -107,6 +110,9 @@ class Muon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self, closure=None):
         loss = closure() if closure is not None else None
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
         for group in self.param_groups:
             params = group["params"]
             if not params:
@@ -114,8 +120,8 @@ class Muon(torch.optim.Optimizer):
             total = sum(p.numel() for p in params)
             flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
             pos = 0
-            for p in params:
-                if p.grad is not None:
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
                     state = self.state[p]
                     buf = state.setdefault("momentum_buffer", torch.zeros_like(p.grad))
                     buf.mul_(group["momentum"]).add_(p.grad)
@@ -124,6 +130,8 @@ class Muon(torch.optim.Optimizer):
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     flat[pos : pos + p.numel()] = g.reshape(-1)
                 pos += p.numel()
+            if distributed:
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
             pos = 0
             for p in params:
                 p.add_(flat[pos : pos + p.numel()].view_as(p).to(p.dtype), alpha=-group["lr"])
@@ -332,8 +340,8 @@ def load_data_shard(file: Path, cfg: Cfg) -> Tensor:
     vals = np.fromfile(file, dtype="<u2", count=n, offset=header_bytes)
     if header.size != 256 or int(header[0]) != 20240520 or vals.size != n:
         raise ValueError(f"bad shard: {file}")
+    lo, hi = (int(vals.min()), int(vals.max())) if vals.size else (0, 0)
     t = torch.from_numpy(vals.astype(np.uint16, copy=False))
-    lo, hi = int(t.min()), int(t.max())
     if lo < 0 or hi >= cfg.vocab_size:
         raise ValueError(f"token id out of range in {file}: {lo}..{hi}")
     return t
@@ -359,9 +367,16 @@ class ByteStream:
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 
-def next_batch(stream: ByteStream, cfg: Cfg, device: torch.device) -> Tensor:
-    local = cfg.train_batch_bytes // cfg.grad_accum_steps
-    return stream.take(local).to(torch.int64).reshape(-1, cfg.train_seq_len).to(device, non_blocking=True)
+def next_batch(stream: ByteStream, cfg: Cfg, device: torch.device, rank: int, world_size: int) -> Tensor:
+    denom = world_size * cfg.grad_accum_steps
+    if cfg.train_batch_bytes % denom != 0:
+        raise ValueError(f"TRAIN_BATCH_BYTES={cfg.train_batch_bytes} must divide WORLD_SIZE*GRAD_ACCUM_STEPS={denom}")
+    local = cfg.train_batch_bytes // denom
+    if local % cfg.train_seq_len != 0:
+        raise ValueError(f"per-rank microbatch bytes={local} must divide TRAIN_SEQ_LEN={cfg.train_seq_len}")
+    chunk = stream.take(local * world_size)
+    start = rank * local
+    return chunk[start : start + local].to(torch.int64).reshape(-1, cfg.train_seq_len).to(device, non_blocking=True)
 
 
 def load_validation(pattern: str, cfg: Cfg) -> tuple[Tensor, int, bool]:
@@ -376,21 +391,35 @@ def load_validation(pattern: str, cfg: Cfg) -> tuple[Tensor, int, bool]:
     return vals, full, capped
 
 
-def eval_validation(cfg: Cfg, model: nn.Module, device: torch.device, val_bytes: Tensor, full: bool) -> dict[str, float | None]:
-    batch_seqs = cfg.val_batch_size // cfg.train_seq_len
+def eval_validation(
+    cfg: Cfg,
+    model: PureByteJEPA,
+    device: torch.device,
+    val_bytes: Tensor,
+    full: bool,
+    rank: int,
+    world_size: int,
+) -> dict[str, float | None]:
+    batch_seqs = max((cfg.val_batch_size // max(world_size, 1)) // cfg.train_seq_len, 1)
     total_seqs = (val_bytes.numel() - 1) // cfg.train_seq_len
+    per_rank = (total_seqs + world_size - 1) // world_size
+    rank_start = min(rank * per_rank, total_seqs)
+    rank_end = min(rank_start + per_rank, total_seqs)
     nll_sum = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     model.eval()
     with torch.inference_mode():
-        for s in range(0, total_seqs, batch_seqs):
-            e = min(s + batch_seqs, total_seqs)
+        for s in range(rank_start, rank_end, batch_seqs):
+            e = min(s + batch_seqs, rank_end)
             local = val_bytes[s * cfg.train_seq_len : e * cfg.train_seq_len + 1].to(device, torch.int64, non_blocking=True)
             batch = local.unfold(0, cfg.train_seq_len + 1, cfg.train_seq_len).contiguous()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 m = model.validation_step(batch)
             nll_sum += m["nll_sum_nat"].to(torch.float64)
             byte_count += m["num_bytes"].to(torch.float64)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(nll_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
     bpb = float((nll_sum / (math.log(2.0) * byte_count)).item())
     model.train()
     return {"proxy_loss": float((nll_sum / byte_count).item()), "subset_val_bpb": bpb, "val_bpb": bpb if full else None}
@@ -470,18 +499,27 @@ def configure_optimizers(model: PureByteJEPA, cfg: Cfg) -> list[torch.optim.Opti
     matrix_ids = {id(p) for p in matrices}
     scalars = [p for _, p in named if id(p) not in embed_ids and id(p) not in matrix_ids]
     opts: list[torch.optim.Optimizer] = []
+    adam_kwargs = dict(betas=(cfg.beta1, cfg.beta2), eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
+    if torch.cuda.is_available():
+        adam_kwargs["fused"] = True
     if embed:
-        opts.append(torch.optim.AdamW([{"params": embed, "lr": cfg.embed_lr, "base_lr": cfg.embed_lr}], betas=(cfg.beta1, cfg.beta2), eps=cfg.adam_eps, weight_decay=cfg.weight_decay))
+        opts.append(torch.optim.AdamW([{"params": embed, "lr": cfg.embed_lr, "base_lr": cfg.embed_lr}], **adam_kwargs))
     if matrices:
         muon = Muon(matrices, lr=cfg.matrix_lr, momentum=cfg.muon_momentum, backend_steps=cfg.muon_backend_steps)
         muon.param_groups[0]["base_lr"] = cfg.matrix_lr
         opts.append(muon)
     if scalars:
-        opts.append(torch.optim.AdamW([{"params": scalars, "lr": cfg.scalar_lr, "base_lr": cfg.scalar_lr}], betas=(cfg.beta1, cfg.beta2), eps=cfg.adam_eps, weight_decay=cfg.weight_decay))
+        opts.append(torch.optim.AdamW([{"params": scalars, "lr": cfg.scalar_lr, "base_lr": cfg.scalar_lr}], **adam_kwargs))
     return opts
 
 
 def lr_scale(cfg: Cfg, step: int, elapsed_ms: float) -> float:
+    if cfg.warmdown_frac > 0 and cfg.max_wallclock_seconds > 0:
+        frac = min(elapsed_ms / max(1000.0 * cfg.max_wallclock_seconds, 1.0), 1.0)
+        start = max(1.0 - cfg.warmdown_frac, 0.0)
+        if frac >= start:
+            return max((1.0 - frac) / max(cfg.warmdown_frac, 1e-9), cfg.min_lr_scale)
+        return 1.0
     avg = elapsed_ms / max(step, 1)
     warmdown_ms = cfg.warmdown_iters * avg
     remaining = max(1000.0 * cfg.max_wallclock_seconds - elapsed_ms, 0.0)
@@ -504,6 +542,17 @@ def main() -> None:
         return
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    master = rank == 0
+    if world_size <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if cfg.grad_accum_steps <= 0:
+        if 8 % world_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must divide 8 when GRAD_ACCUM_STEPS is auto")
+        cfg.grad_accum_steps = max(1, 8 // world_size)
     load_tokenizer_check(cfg)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -511,25 +560,40 @@ def main() -> None:
     torch.cuda.manual_seed_all(cfg.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    device = torch.device("cuda", 0)
+    device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
 
     run_dir = SCRIPT_DIR / "runs" / cfg.run_id
-    if (run_dir / "summary.json").exists():
-        print(f"skip {cfg.run_id}: summary exists")
+    skip = torch.tensor(int((run_dir / "summary.json").exists()), device=device)
+    if distributed:
+        dist.all_reduce(skip, op=dist.ReduceOp.MAX)
+    if bool(skip.item()):
+        if master:
+            print(f"skip {cfg.run_id}: summary exists")
+        if distributed:
+            dist.destroy_process_group()
         return
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if master:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        dist.barrier()
     log_path = run_dir / "train.log"
 
     def log(msg: str, console: bool = True) -> None:
+        if not master:
+            return
         if console:
             print(msg)
         with log_path.open("a", encoding="utf-8") as f:
             print(msg, file=f)
 
     code = Path(__file__).read_text()
-    (run_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2, sort_keys=True) + "\n")
-    (run_dir / "train_jepa_snapshot.py").write_text(code)
+    if master:
+        (run_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2, sort_keys=True) + "\n")
+        (run_dir / "train_jepa_snapshot.py").write_text(code)
     log(code, console=False)
     log("=" * 100, console=False)
 
@@ -537,11 +601,15 @@ def main() -> None:
     log(f"dataset:{Path(cfg.data_path).name} train_shards:{len(glob.glob(cfg.train_files))}")
     log(f"val_target_bytes:{val_bytes.numel() - 1} full_target_bytes:{full_val_bytes} subset_only:{int(capped)}")
 
-    model = PureByteJEPA(cfg).to(device)
-    opts = configure_optimizers(model, cfg)
+    base_model = PureByteJEPA(cfg).to(device)
+    model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
+    opts = configure_optimizers(base_model, cfg)
     train_stream = ByteStream(cfg.train_files, cfg)
-    log(f"model_params:{sum(p.numel() for p in model.parameters())}")
+    log(f"model_params:{sum(p.numel() for p in base_model.parameters())}")
+    log(f"world_size:{world_size} grad_accum_steps:{cfg.grad_accum_steps}")
     log(f"iterations:{cfg.iterations} batch_bytes:{cfg.train_batch_bytes} seq_len:{cfg.train_seq_len}")
+    log(f"optimizer embed_lr:{cfg.embed_lr:.6g} matrix_lr:{cfg.matrix_lr:.6g} scalar_lr:{cfg.scalar_lr:.6g} beta2:{cfg.beta2:.6g}")
+    log(f"schedule warmdown_frac:{cfg.warmdown_frac:.4g} min_lr_scale:{cfg.min_lr_scale:.4g} max_wallclock_seconds:{cfg.max_wallclock_seconds:.1f}")
 
     def zero_grad() -> None:
         for opt in opts:
@@ -567,7 +635,7 @@ def main() -> None:
         if (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0) or step == cfg.iterations:
             torch.cuda.synchronize()
             train_ms += 1000.0 * (time.perf_counter() - t0)
-            latest_val = eval_validation(cfg, model, device, val_bytes, full=not capped)
+            latest_val = eval_validation(cfg, base_model, device, val_bytes, full=not capped, rank=rank, world_size=world_size)
             msg_bpb = f"val_bpb:{latest_val['val_bpb']:.8f}" if latest_val["val_bpb"] is not None else f"val_bpb_subset:{latest_val['subset_val_bpb']:.8f} val_bpb:NA"
             log(f"step:{step}/{cfg.iterations} val_proxy_loss:{latest_val['proxy_loss']:.6f} {msg_bpb} train_time:{train_ms:.0f}ms step_avg:{train_ms / max(step, 1):.2f}ms")
             torch.cuda.synchronize()
@@ -587,8 +655,10 @@ def main() -> None:
 
         zero_grad()
         sums: dict[str, float] = {}
-        for _ in range(cfg.grad_accum_steps):
-            batch = next_batch(train_stream, cfg, device)
+        for micro_step in range(cfg.grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro_step == cfg.grad_accum_steps - 1
+            batch = next_batch(train_stream, cfg, device, rank, world_size)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 metrics = model(batch)
             (metrics["loss"] / cfg.grad_accum_steps).backward()
@@ -600,8 +670,10 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(train_params, cfg.grad_clip_norm)
         for opt in opts:
             opt.step()
-        model.update_target_encoder()
+        base_model.update_target_encoder()
         zero_grad()
+        if distributed:
+            model.require_backward_grad_sync = True
         step += 1
 
         if step <= 10 or step % cfg.train_log_every == 0:
@@ -609,46 +681,63 @@ def main() -> None:
             approx = train_ms + 1000.0 * (time.perf_counter() - t0)
             parts = " ".join(f"{k}:{v:.6f}" for k, v in sums.items())
             log(f"step:{step}/{cfg.iterations} {parts} train_time:{approx:.0f}ms step_avg:{approx / step:.2f}ms")
-        if train_ms + 1000.0 * (time.perf_counter() - t0) >= 1000.0 * cfg.max_wallclock_seconds:
+        reached_cap = train_ms + 1000.0 * (time.perf_counter() - t0) >= 1000.0 * cfg.max_wallclock_seconds
+        if distributed:
+            reached = torch.tensor(int(reached_cap), device=device)
+            dist.all_reduce(reached, op=dist.ReduceOp.MAX)
+            reached_cap = bool(reached.item())
+        if reached_cap:
             log(f"stopping_early step:{step}/{cfg.iterations}")
             break
 
     if latest_val is None:
-        latest_val = eval_validation(cfg, model, device, val_bytes, full=not capped)
+        latest_val = eval_validation(cfg, base_model, device, val_bytes, full=not capped, rank=rank, world_size=world_size)
     raw_path = run_dir / "final_model.pt"
     q_path = run_dir / "final_model.int8.ptz"
-    export_state = {k: v.detach().cpu().contiguous().clone() for k, v in model.export_state_dict().items()}
-    torch.save(export_state, raw_path)
-    quant_obj, qstats = quantize_state_dict(export_state)
-    buf = io.BytesIO()
-    torch.save(quant_obj, buf)
-    q_path.write_bytes(zlib.compress(buf.getvalue(), level=9))
-    log(f"Serialized model:{raw_path.stat().st_size} bytes")
-    log(f"Serialized model int8+zlib:{q_path.stat().st_size} bytes")
-    log(f"Code size:{len(code.encode())} bytes total_submission_int8_zlib:{q_path.stat().st_size + len(code.encode())} bytes")
+    if master:
+        export_state = {k: v.detach().cpu().contiguous().clone() for k, v in base_model.export_state_dict().items()}
+        torch.save(export_state, raw_path)
+        quant_obj, qstats = quantize_state_dict(export_state)
+        buf = io.BytesIO()
+        torch.save(quant_obj, buf)
+        q_path.write_bytes(zlib.compress(buf.getvalue(), level=9))
+        log(f"Serialized model:{raw_path.stat().st_size} bytes")
+        log(f"Serialized model int8+zlib:{q_path.stat().st_size} bytes")
+        log(f"Code size:{len(code.encode())} bytes total_submission_int8_zlib:{q_path.stat().st_size + len(code.encode())} bytes")
+    else:
+        qstats = {}
+    if distributed:
+        dist.barrier()
 
     disk_obj = torch.load(io.BytesIO(zlib.decompress(q_path.read_bytes())), map_location="cpu")
-    model.load_state_dict(dequantize_state_dict(disk_obj), strict=False)
-    q_metrics = eval_validation(cfg, model, device, val_bytes, full=not capped)
+    base_model.load_state_dict(dequantize_state_dict(disk_obj), strict=False)
+    q_metrics = eval_validation(cfg, base_model, device, val_bytes, full=not capped, rank=rank, world_size=world_size)
     msg_bpb = f"val_bpb:{q_metrics['val_bpb']:.8f}" if q_metrics["val_bpb"] is not None else f"val_bpb_subset:{q_metrics['subset_val_bpb']:.8f} val_bpb:NA"
     log(f"final_int8_zlib_roundtrip val_proxy_loss:{q_metrics['proxy_loss']:.6f} {msg_bpb}")
-    summary = {
-        "run_id": cfg.run_id,
-        "raw_final_proxy_val_loss": latest_val["proxy_loss"],
-        "raw_final_subset_val_bpb": latest_val["subset_val_bpb"],
-        "raw_final_val_bpb": latest_val["val_bpb"],
-        "proxy_val_loss": q_metrics["proxy_loss"],
-        "subset_val_bpb": q_metrics["subset_val_bpb"],
-        "val_bpb": q_metrics["val_bpb"],
-        "proxy_only": q_metrics["val_bpb"] is None,
-        "validation_bytes": int(val_bytes.numel() - 1),
-        "validation_full_bytes": int(full_val_bytes),
-        "artifact_model_bytes_int8_zlib": q_path.stat().st_size,
-        "artifact_code_bytes": len(code.encode()),
-        "artifact_total_bytes_int8_zlib": q_path.stat().st_size + len(code.encode()),
-        "quant_stats": qstats,
-    }
-    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    if master:
+        summary = {
+            "run_id": cfg.run_id,
+            "raw_final_proxy_val_loss": latest_val["proxy_loss"],
+            "raw_final_subset_val_bpb": latest_val["subset_val_bpb"],
+            "raw_final_val_bpb": latest_val["val_bpb"],
+            "proxy_val_loss": q_metrics["proxy_loss"],
+            "subset_val_bpb": q_metrics["subset_val_bpb"],
+            "val_bpb": q_metrics["val_bpb"],
+            "proxy_only": q_metrics["val_bpb"] is None,
+            "validation_bytes": int(val_bytes.numel() - 1),
+            "validation_full_bytes": int(full_val_bytes),
+            "artifact_model_bytes_int8_zlib": q_path.stat().st_size,
+            "artifact_code_bytes": len(code.encode()),
+            "artifact_total_bytes_int8_zlib": q_path.stat().st_size + len(code.encode()),
+            "world_size": world_size,
+            "global_train_batch_bytes": cfg.train_batch_bytes,
+            "per_rank_microbatch_bytes": cfg.train_batch_bytes // (world_size * cfg.grad_accum_steps),
+            "quant_stats": qstats,
+        }
+        (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

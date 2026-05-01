@@ -13,14 +13,28 @@ VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv_jepa}"
 TRAIN_SCRIPT="$HERE/train_jepa.py"
 RUN_ID="${RUN_ID:-jepa_lagmixer_10min_$(date -u +%Y%m%dT%H%M%SZ)}"
 TRAIN_SHARDS="${TRAIN_SHARDS:-80}"
-GPU_ID="${GPU_ID:-0}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$GPU_ID}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-600}"
 ITERATIONS="${ITERATIONS:-20000}"
 WARMDOWN_ITERS="${WARMDOWN_ITERS:-1200}"
+WARMDOWN_FRAC="${WARMDOWN_FRAC:-0.85}"
+TRAIN_BATCH_BYTES="${TRAIN_BATCH_BYTES:-786432}"
+TRAIN_SEQ_LEN="${TRAIN_SEQ_LEN:-256}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-0}"
+OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+NCCL_NET="${NCCL_NET:-Socket}"
 VAL_MAX_BYTES="${VAL_MAX_BYTES:-0}"
 VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-0}"
-TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-50}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-524288}"
+TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-500}"
+EMBED_LR="${EMBED_LR:-0.03}"
+MATRIX_LR="${MATRIX_LR:-0.026}"
+SCALAR_LR="${SCALAR_LR:-0.02}"
+BETA2="${BETA2:-0.99}"
+MUON_MOMENTUM="${MUON_MOMENTUM:-0.97}"
+MIN_LR_SCALE="${MIN_LR_SCALE:-0.10}"
+TARGET_EMA_DECAY="${TARGET_EMA_DECAY:-0.9965}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 SUBMISSION_AUTHOR="${SUBMISSION_AUTHOR:-TODO}"
 SUBMISSION_GITHUB_ID="${SUBMISSION_GITHUB_ID:-TODO}"
@@ -80,7 +94,7 @@ check_machine() {
   if [[ "$gpu_count" -lt 8 ]]; then
     log "WARNING: detected $gpu_count GPU(s), not 8. The challenge record budget is 8xH100."
   fi
-  log "This compact trainer is single-process and will use CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES."
+  log "Launching with torchrun nproc_per_node=$NPROC_PER_NODE and CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES."
 }
 
 download_data() {
@@ -93,7 +107,9 @@ download_data() {
 
 run_training() {
   log "Starting training run_id=$RUN_ID with a ${MAX_WALLCLOCK_SECONDS}s training cap."
-  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
+  PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}" \
+  OMP_NUM_THREADS="$OMP_NUM_THREADS" \
+  NCCL_NET="$NCCL_NET" \
   CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   RUN_ID="$RUN_ID" \
   DATA_PATH="$DATA_PATH" \
@@ -102,9 +118,21 @@ run_training() {
   ITERATIONS="$ITERATIONS" \
   WARMDOWN_ITERS="$WARMDOWN_ITERS" \
   VAL_MAX_BYTES="$VAL_MAX_BYTES" \
+  VAL_BATCH_SIZE="$VAL_BATCH_SIZE" \
   VAL_LOSS_EVERY="$VAL_LOSS_EVERY" \
   TRAIN_LOG_EVERY="$TRAIN_LOG_EVERY" \
-  python "$TRAIN_SCRIPT"
+  TRAIN_BATCH_BYTES="$TRAIN_BATCH_BYTES" \
+  TRAIN_SEQ_LEN="$TRAIN_SEQ_LEN" \
+  GRAD_ACCUM_STEPS="$GRAD_ACCUM_STEPS" \
+  WARMDOWN_FRAC="$WARMDOWN_FRAC" \
+  EMBED_LR="$EMBED_LR" \
+  MATRIX_LR="$MATRIX_LR" \
+  SCALAR_LR="$SCALAR_LR" \
+  BETA2="$BETA2" \
+  MUON_MOMENTUM="$MUON_MOMENTUM" \
+  MIN_LR_SCALE="$MIN_LR_SCALE" \
+  TARGET_EMA_DECAY="$TARGET_EMA_DECAY" \
+  torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" "$TRAIN_SCRIPT"
 }
 
 prepare_submission() {
@@ -119,17 +147,21 @@ prepare_submission() {
   cp "$RUN_DIR/train.log" "$RUN_DIR/config.json" "$summary" "$artifact" "$BUNDLE_DIR/"
   cat > "$BUNDLE_DIR/run_command.sh" <<EOF
 #!/usr/bin/env bash
-CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
+CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES PYTORCH_ALLOC_CONF=expandable_segments:True OMP_NUM_THREADS=$OMP_NUM_THREADS NCCL_NET=$NCCL_NET \\
 RUN_ID=$RUN_ID DATA_PATH='$DATA_PATH' TOKENIZER_PATH='$TOKENIZER_PATH' \\
 MAX_WALLCLOCK_SECONDS=$MAX_WALLCLOCK_SECONDS ITERATIONS=$ITERATIONS WARMDOWN_ITERS=$WARMDOWN_ITERS \\
-VAL_MAX_BYTES=$VAL_MAX_BYTES VAL_LOSS_EVERY=$VAL_LOSS_EVERY TRAIN_LOG_EVERY=$TRAIN_LOG_EVERY \\
-python records/track_non_record_16mb/2026-05-01_PureByteJEPA_FinalWrap/train_jepa.py
+WARMDOWN_FRAC=$WARMDOWN_FRAC TRAIN_BATCH_BYTES=$TRAIN_BATCH_BYTES TRAIN_SEQ_LEN=$TRAIN_SEQ_LEN GRAD_ACCUM_STEPS=$GRAD_ACCUM_STEPS \\
+VAL_MAX_BYTES=$VAL_MAX_BYTES VAL_BATCH_SIZE=$VAL_BATCH_SIZE VAL_LOSS_EVERY=$VAL_LOSS_EVERY TRAIN_LOG_EVERY=$TRAIN_LOG_EVERY \\
+EMBED_LR=$EMBED_LR MATRIX_LR=$MATRIX_LR SCALAR_LR=$SCALAR_LR BETA2=$BETA2 MUON_MOMENTUM=$MUON_MOMENTUM \\
+MIN_LR_SCALE=$MIN_LR_SCALE TARGET_EMA_DECAY=$TARGET_EMA_DECAY \\
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE records/track_non_record_16mb/2026-04-31_PureByteJEPA/train_jepa.py
 EOF
   chmod +x "$BUNDLE_DIR/run_command.sh"
 
   SUMMARY_PATH="$summary" \
   BUNDLE_DIR="$BUNDLE_DIR" \
   RUN_ID="$RUN_ID" \
+  NPROC_PER_NODE="$NPROC_PER_NODE" \
   SUBMISSION_AUTHOR="$SUBMISSION_AUTHOR" \
   SUBMISSION_GITHUB_ID="$SUBMISSION_GITHUB_ID" \
   SUBMISSION_NAME="$SUBMISSION_NAME" \
@@ -157,7 +189,7 @@ payload = {
     "bytes_total": summary.get("artifact_total_bytes_int8_zlib"),
     "bytes_code": summary.get("artifact_code_bytes"),
     "run_id": summary.get("run_id", os.environ["RUN_ID"]),
-    "hardware": "8xH100 target machine; compact trainer uses one visible CUDA device",
+    "hardware": "8xH100 target machine; torchrun nproc_per_node=" + os.environ.get("NPROC_PER_NODE", "8"),
     "training_cap_seconds": float(os.environ["MAX_WALLCLOCK_SECONDS"]),
     "artifact": "final_model.int8.ptz",
 }
