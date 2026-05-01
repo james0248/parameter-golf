@@ -36,12 +36,16 @@ MUON_MOMENTUM="${MUON_MOMENTUM:-0.97}"
 MIN_LR_SCALE="${MIN_LR_SCALE:-0.10}"
 TARGET_EMA_DECAY="${TARGET_EMA_DECAY:-0.9965}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+MATCHED_FINEWEB_REPO_ID="${MATCHED_FINEWEB_REPO_ID:-hyeonsjung/parameter-golf}"
+MATCHED_FINEWEB_REMOTE_ROOT_PREFIX="${MATCHED_FINEWEB_REMOTE_ROOT_PREFIX:-datasets}"
 SUBMISSION_AUTHOR="${SUBMISSION_AUTHOR:-TODO}"
 SUBMISSION_GITHUB_ID="${SUBMISSION_GITHUB_ID:-TODO}"
 SUBMISSION_NAME="${SUBMISSION_NAME:-PureByte JEPA LagMixer}"
 SUBMISSION_TRACK="${SUBMISSION_TRACK:-10min_16mb}"
 SUBMISSION_BLURB="${SUBMISSION_BLURB:-Pure byte260 contextual-delta JEPA with LagMixer, auxiliary LM-head scoring, Muon training, and mixed int8+zlib export.}"
 MAX_SUBMISSION_BYTES="${MAX_SUBMISSION_BYTES:-16000000}"
+
+export MATCHED_FINEWEB_REPO_ID MATCHED_FINEWEB_REMOTE_ROOT_PREFIX
 
 DATA_PATH="$REPO_ROOT/data/datasets/fineweb10B_byte260"
 TOKENIZER_PATH="$REPO_ROOT/data/tokenizers/fineweb_pure_byte_260.json"
@@ -98,7 +102,27 @@ check_machine() {
 }
 
 download_data() {
-  log "Downloading cached byte260 data if missing: train_shards=$TRAIN_SHARDS"
+  log "Downloading cached byte260 data if missing: train_shards=$TRAIN_SHARDS repo=$MATCHED_FINEWEB_REPO_ID"
+  MATCHED_FINEWEB_REPO_ID="$MATCHED_FINEWEB_REPO_ID" \
+  MATCHED_FINEWEB_REMOTE_ROOT_PREFIX="$MATCHED_FINEWEB_REMOTE_ROOT_PREFIX" \
+  python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("data/manifest.json")
+if not path.is_file():
+    raise SystemExit(0)
+try:
+    payload = json.loads(path.read_text())
+except Exception:
+    path.unlink(missing_ok=True)
+    raise SystemExit(0)
+names = {entry.get("name") for entry in payload.get("datasets", [])}
+if "fineweb10B_byte260" not in names:
+    path.unlink(missing_ok=True)
+PY
+  MATCHED_FINEWEB_REPO_ID="$MATCHED_FINEWEB_REPO_ID" \
+  MATCHED_FINEWEB_REMOTE_ROOT_PREFIX="$MATCHED_FINEWEB_REMOTE_ROOT_PREFIX" \
   run python data/cached_challenge_fineweb.py --variant byte260 --train-shards "$TRAIN_SHARDS"
   test -f "$TOKENIZER_PATH"
   test -n "$(find "$DATA_PATH" -name 'fineweb_val_*.bin' -print -quit)"
