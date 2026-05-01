@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""Final-only pure-byte JEPA trainer.
-
-Kept branch: byte260, contextual-delta JEPA, LagMixer, auxiliary LM head,
-8xH100 DDP Muon training, train_gpt-style contiguous validation, mixed int8 export.
-"""
-
-from __future__ import annotations
-
 import glob
 import io
 import json
@@ -79,6 +70,8 @@ class Cfg:
     muon_momentum_warmup_steps: int = 1500
     lag_mixer_lags: int = 2
     lag_mixer_init: float = 0.1
+    smear_gate_enabled: bool = bool(int(os.environ.get("SMEAR_GATE_ENABLED", "1")))
+    smear_gate_window: int = int(os.environ.get("SMEAR_GATE_WINDOW", os.environ.get("GATE_WINDOW", "12")))
     bos_attention_mask: bool = False
 
     @property
@@ -176,6 +169,22 @@ class LagMixer(nn.Module):
         return x + mixed
 
 
+class SmearGate(nn.Module):
+    def __init__(self, dim: int, window: int, bos_token_id: int):
+        super().__init__()
+        self.window = min(window, dim)
+        self.bos_token_id = bos_token_id
+        self.weight = nn.Parameter(torch.zeros(1, self.window))
+        self.lam = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+    def forward(self, x: Tensor, tokens: Tensor) -> Tensor:
+        if x.size(1) <= 1:
+            return x
+        g = self.lam.to(x.dtype) * torch.sigmoid(F.linear(x[:, 1:, : self.window].contiguous(), self.weight.to(x.dtype)))
+        not_bos = (tokens[:, 1:] != self.bos_token_id).to(x.dtype).unsqueeze(-1)
+        return torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1] * not_bos], dim=1)
+
+
 class SequenceEncoder(nn.Module):
     def __init__(self, cfg: Cfg, *, causal: bool):
         super().__init__()
@@ -183,6 +192,7 @@ class SequenceEncoder(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.model_dim)
         self.pos_emb = nn.Parameter(torch.zeros(1, cfg.train_seq_len + 1, cfg.model_dim))
+        self.smear_gate = SmearGate(cfg.model_dim, cfg.smear_gate_window, cfg.bos_token_id) if cfg.smear_gate_enabled else None
         self.lag_mixer = LagMixer(cfg.model_dim, cfg.lag_mixer_lags, cfg.lag_mixer_init, cfg.bos_token_id)
         self.blocks = nn.ModuleList(
             [EncoderBlock(cfg.model_dim, cfg.num_heads, cfg.mlp_hidden_dim) for _ in range(cfg.num_layers)]
@@ -206,6 +216,8 @@ class SequenceEncoder(nn.Module):
 
     def forward(self, tokens: Tensor) -> Tensor:
         x = self.tok_emb(tokens) + self.pos_emb[:, : tokens.size(1)]
+        if self.smear_gate is not None:
+            x = self.smear_gate(x, tokens)
         x = self.lag_mixer(x, tokens)
         mask = self._attention_mask(tokens)
         for block in self.blocks:
@@ -438,7 +450,7 @@ KEEP_FP16_PATTERNS = (
     "online_encoder.blocks.1.mlp",
     "predictor.blocks.0.mlp",
 )
-KEEP_FP32_PATTERNS = ("lag_weights",)
+KEEP_FP32_PATTERNS = ("lag_weights", "smear_gate")
 
 
 def q_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
